@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar, ReferenceLine } from "recharts";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar, ReferenceLine, Cell } from "recharts";
 import { Play, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
 
 const DEFAULT_START = "2024-01-01";
@@ -178,7 +178,7 @@ export function BacktestPanel() {
                         <ReferenceLine y={0} stroke="#475569" />
                         <Bar dataKey="pnl" name="Net P&L" radius={[4, 4, 0, 0]}>
                           {Object.entries(result.by_strategy).map(([k, v], i) => (
-                            <Bar.Cell key={i} fill={v.net_pnl >= 0 ? "#10b981" : "#f43f5e"} />
+                            <Cell key={i} fill={v.net_pnl >= 0 ? "#10b981" : "#f43f5e"} />
                           ))}
                         </Bar>
                       </BarChart>

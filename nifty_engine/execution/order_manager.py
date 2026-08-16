@@ -113,7 +113,9 @@ class OrderManager:
             )
         # Mid-price fill with conservative slippage of 1 point against us
         mid = ((q.bid or q.ltp) + (q.ask or q.ltp)) / 2 if (q.bid and q.ask) else q.ltp
-        fill = max(0.05, mid - 1.0)   # we pay 1 point over mid
+        # FIX: we pay 1 point OVER mid (slippage is adverse to us)
+        # Previously this subtracted 1pt (giving us a better fill) — inverted.
+        fill = max(0.05, mid + 1.0)   # we pay 1 point over mid
         qty = req.lots * req.lot_size
 
         position = Position(

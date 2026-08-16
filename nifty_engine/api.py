@@ -60,19 +60,11 @@ CAPITAL = float(os.environ.get("ENGINE_CAPITAL", "1000000"))
 # fetches security list). Reuse one instance across all requests.
 _broker_singleton = None
 
-# Cached snapshot (5s TTL) — building a snapshot involves 4 broker API calls
-# (NIFTY, VIX, BankNifty, NIFTY futures), each ~1-2s. Cache prevents the API
-# server from being overwhelmed by polling.
-_cached_snapshot = None
-_cached_snapshot_ts = 0.0
-
-# Cached decision (30s TTL) — running Engine() creates a new DhanBroker which
-# is expensive (loads security list CSV = 50MB).
-_cached_decision = None
-_cached_decision_ts = 0.0
-
-SNAPSHOT_TTL_SECONDS = 30.0
-DECISION_TTL_SECONDS = 30.0
+# Singleton engine — the engine holds position state, risk state, thesis
+# tracker, protection layer, MAE/MFE tracker. If we rebuild it per request,
+# all of that state is lost. This singleton persists across the API's lifetime.
+_engine_singleton = None
+_engine_lock = threading.Lock()
 
 
 def get_broker():
@@ -81,6 +73,34 @@ def get_broker():
         from .data import DhanBroker
         _broker_singleton = DhanBroker()
     return _broker_singleton
+
+
+def get_engine():
+    """Get the singleton Engine instance.
+
+    CRITICAL: The engine holds position state (order_manager), risk state
+    (risk engine), and position trackers (thesis, protection, MAE/MFE).
+    Rebuilding it per request would wipe all of that. This singleton ensures
+    state persists across API calls.
+    """
+    global _engine_singleton
+    if _engine_singleton is None:
+        with _engine_lock:
+            if _engine_singleton is None:
+                _engine_singleton = Engine(
+                    mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR,
+                    broker=get_broker(),
+                )
+    return _engine_singleton
+
+
+# Cached snapshot (30s TTL) — building a snapshot involves 4 broker API calls
+_cached_snapshot = None
+_cached_snapshot_ts = 0.0
+
+# Cached decision (30s TTL)
+_cached_decision = None
+_cached_decision_ts = 0.0
 
 
 def get_cached_snapshot():
@@ -92,19 +112,15 @@ def get_cached_snapshot():
     Thread-safe via a lock — only one thread refreshes at a time.
     """
     import time
-    import threading
     global _cached_snapshot, _cached_snapshot_ts
     if not hasattr(get_cached_snapshot, '_lock'):
         get_cached_snapshot._lock = threading.Lock()
     lock = get_cached_snapshot._lock
     now = time.time()
-    # Fast path: return cached if fresh
-    if _cached_snapshot is not None and (now - _cached_snapshot_ts) <= SNAPSHOT_TTL_SECONDS:
+    if _cached_snapshot is not None and (now - _cached_snapshot_ts) <= 30.0:
         return _cached_snapshot
-    # Slow path: acquire lock to refresh
     with lock:
-        # Double-check after acquiring lock
-        if _cached_snapshot is not None and (time.time() - _cached_snapshot_ts) <= SNAPSHOT_TTL_SECONDS:
+        if _cached_snapshot is not None and (time.time() - _cached_snapshot_ts) <= 30.0:
             return _cached_snapshot
         try:
             b = get_broker()
@@ -118,25 +134,23 @@ def get_cached_snapshot():
 def get_cached_decision():
     """Get a cached decision (refresh every 30s).
 
+    Uses the singleton engine so position/risk state persists across calls.
     Thread-safe via a lock.
     """
     import time
-    import threading
     global _cached_decision, _cached_decision_ts
     if not hasattr(get_cached_decision, '_lock'):
         get_cached_decision._lock = threading.Lock()
     lock = get_cached_decision._lock
     now = time.time()
-    if _cached_decision is not None and (now - _cached_decision_ts) <= DECISION_TTL_SECONDS:
+    if _cached_decision is not None and (now - _cached_decision_ts) <= 30.0:
         return _cached_decision
     with lock:
-        if _cached_decision is not None and (time.time() - _cached_decision_ts) <= DECISION_TTL_SECONDS:
+        if _cached_decision is not None and (time.time() - _cached_decision_ts) <= 30.0:
             return _cached_decision
         try:
-            engine = Engine(
-                mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR,
-                broker=get_broker(),
-            )
+            # Use singleton engine — preserves position/risk state across calls
+            engine = get_engine()
             _cached_decision = engine.run_cycle()
             _cached_decision_ts = time.time()
         except Exception as e:
@@ -297,16 +311,20 @@ def alerts_test():
 
 @app.get("/api/status")
 def status():
-    """Risk engine state + open positions + capital."""
-    engine = Engine(mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR)
+    """Risk engine state + open positions + capital.
+
+    Uses the singleton engine so open positions are visible — previously this
+    created a fresh Engine on every call, so open_positions was always [].
+    """
+    engine = get_engine()
     return {
         "risk": engine.risk.status(),
         "open_positions": [
             {
                 "strategy": p.strategy.value,
-                "option": p.option.symbol,
-                "strike": p.option.strike,
-                "option_type": p.option.option_type.value,
+                "option": p.option.symbol if p.option else (p.long_leg.symbol if p.long_leg else "—"),
+                "strike": (p.option.strike if p.option else (p.long_leg.strike if p.long_leg else 0)),
+                "option_type": (p.option.option_type.value if p.option else (p.long_leg.option_type.value if p.long_leg else "—")),
                 "lots": p.lots,
                 "entry_price": p.entry_price,
                 "current_price": p.current_price,
@@ -314,6 +332,14 @@ def status():
                 "take_profit": p.take_profit,
                 "unrealised_pnl": p.unrealised_pnl,
                 "entry_time": p.entry_time.isoformat(),
+                # Phase 10: spread fields
+                "is_spread": p.long_leg is not None and p.short_leg is not None,
+                "long_leg": p.long_leg.symbol if p.long_leg else None,
+                "short_leg": p.short_leg.symbol if p.short_leg else None,
+                "spread_width": p.spread_width,
+                "max_loss": p.max_loss,
+                "max_gain": p.max_gain,
+                "breakeven": p.breakeven,
             }
             for p in engine.order_manager.positions if p.status == "OPEN"
         ],
@@ -466,15 +492,20 @@ def update_config(name: str, body: ConfigUpdate):
 
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket):
-    """Push a fresh Decision to the client every N seconds."""
+    """Push a fresh Decision to the client every N seconds.
+
+    Uses the singleton engine so position/risk state persists.
+    """
     await websocket.accept()
-    interval = 5
+    interval = 30  # 30s — matches the decision cache TTL
     try:
         while True:
             try:
-                engine = Engine(mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR)
-                d = engine.run_cycle()
-                await websocket.send_json(_serialize_decision(d))
+                d = get_cached_decision()
+                if d is None:
+                    await websocket.send_json({"error": "engine unavailable", "action": "NO_TRADE"})
+                else:
+                    await websocket.send_json(_serialize_decision(d))
             except Exception as exc:
                 await websocket.send_json({"error": str(exc), "type": type(exc).__name__})
             await asyncio.sleep(interval)

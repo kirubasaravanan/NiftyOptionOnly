@@ -130,6 +130,25 @@ else
     echo "ℹ️  mini-services 目录不存在，跳过"
 fi
 
+# 启动 FastAPI 后端 (NIFTY Engine API)
+if [ -f "../scripts/supervisor.py" ]; then
+    echo "🚀 启动 FastAPI 后端 (NIFTY Engine)..."
+    cd "$BUILD_DIR/.."
+    python -u scripts/supervisor.py > "$BUILD_DIR/api.log" 2>&1 &
+    API_PID=$!
+    pids="$pids $API_PID"
+    
+    sleep 2
+    if ! kill -0 "$API_PID" 2>/dev/null; then
+        echo "❌ FastAPI 后端启动失败"
+    else
+        echo "✅ FastAPI 后端已启动 (PID: $API_PID, Port: 8000)"
+    fi
+    cd "$BUILD_DIR"
+else
+    echo "⚠️  未找到 scripts/supervisor.py — FastAPI 后端将不会启动"
+fi
+
 # 启动 Caddy（如果存在 Caddyfile）
 echo "🚀 启动 Caddy..."
 

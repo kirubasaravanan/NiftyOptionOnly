@@ -490,7 +490,12 @@ class Engine:
                                     thesis_score=thesis_score)
 
     def _exit_position(self, pos, exit_price, snapshot, now, reason, protection_result=None, thesis_score=None):
-        """Close a position and emit EXIT + TRADE_REVIEW alerts."""
+        """Close a position and emit EXIT + TRADE_REVIEW alerts.
+
+        CRITICAL: Calls risk.record_trade_result() so the daily loss cap,
+        max-trades/day, and consecutive-loss cooldown are actually updated.
+        Without this, the risk engine's evaluate() checks against stale values.
+        """
         # Close via order manager
         try:
             self.order_manager.close_position(pos, exit_price)
@@ -498,15 +503,38 @@ class Engine:
             pos.status = "EXITED"
             pos.current_price = exit_price
 
-        # Compute realized P&L
+        # Compute realized P&L — use exit_price (which includes slippage from
+        # close_position) rather than the raw exit_price parameter
+        actual_exit_price = pos.current_price or exit_price
         qty = pos.lots * 75
-        gross = (exit_price - pos.entry_price) * qty
-        from .execution import CostModel
-        cost = CostModel().cost_for_round_trip(pos.entry_price, exit_price, qty).total
+
+        # For spreads, P&L is computed differently:
+        # gross = (actual_exit_net_debit - entry_net_debit) * qty
+        # where exit_net_debit = long_leg_current - short_leg_current
+        if pos.long_leg is not None and pos.short_leg is not None:
+            # Spread: use net debit change
+            gross = (actual_exit_price - pos.entry_price) * qty
+            from .execution import CostModel
+            cost = CostModel().cost_for_spread_round_trip(
+                pos.long_leg.ltp, pos.long_leg_current or pos.long_leg.ltp,
+                pos.short_leg.ltp, pos.short_leg_current or pos.short_leg.ltp,
+                qty,
+            ).total
+        else:
+            # Single-leg: use premium change
+            gross = (actual_exit_price - pos.entry_price) * qty
+            from .execution import CostModel
+            cost = CostModel().cost_for_round_trip(pos.entry_price, actual_exit_price, qty).total
+
         net = gross - cost
 
+        # CRITICAL FIX: Record trade result so risk engine state updates
+        # (daily P&L, trade count, consecutive losses, cooldown)
+        self.risk.record_trade_result(net, now)
+        self.risk.release_open_exposure(pos.entry_price * qty)
+
         # Finalize MAE/MFE
-        mae_mfe_record = self.mae_mfe.finalize(pos, exit_price, net)
+        mae_mfe_record = self.mae_mfe.finalize(pos, actual_exit_price, net)
 
         # Emit EXIT alert
         self.notifier.send_alert(

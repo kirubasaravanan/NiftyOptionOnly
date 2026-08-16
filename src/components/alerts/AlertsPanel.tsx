@@ -57,7 +57,7 @@ export function AlertsPanel() {
 
   const testMutation = useMutation({
     mutationFn: () =>
-      fetch(`http://localhost:81/api/alerts/test?XTransformPort=8000`, {
+      fetch(`/api/alerts/test`, {
         method: "POST",
       }).then((r) => r.json()),
     onSuccess: (data: { ok: boolean; sent: boolean }) => {

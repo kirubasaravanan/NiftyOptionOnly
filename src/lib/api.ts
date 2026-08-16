@@ -1,17 +1,15 @@
 // API client + TypeScript types for the NIFTY Options Trading Engine
 //
-// The Caddy gateway runs on port 81 and routes /api/*?XTransformPort=N to localhost:N.
-// The Next.js dev server runs on port 3000. So frontend requests must go to
-// http://localhost:81/api/...?XTransformPort=8000 to reach the FastAPI backend.
-
-const GATEWAY_PORT = 81;
-const API_PORT = 8000;
+// FIX: Previously hardcoded http://localhost:81 which only works from the
+// sandbox's own browser. Now uses relative paths so the Next.js server-side
+// rewrite (configured in next.config) proxies /api/* to the FastAPI backend
+// on port 8000. This works from any browser — local, sandbox preview, or
+// public URL.
 
 function apiUrl(path: string): string {
-  // Always target the Caddy gateway with XTransformPort so it proxies to the FastAPI backend.
-  // Relative paths would hit the Next.js dev server (port 3000) which returns 404 for /api/*.
-  const sep = path.includes("?") ? "&" : "?";
-  return `http://localhost:${GATEWAY_PORT}${path}${sep}XTransformPort=${API_PORT}`;
+  // Relative path — Next.js rewrites /api/* to http://localhost:8000/api/*
+  // Works from any origin (localhost, sandbox preview, public URL)
+  return path;
 }
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {

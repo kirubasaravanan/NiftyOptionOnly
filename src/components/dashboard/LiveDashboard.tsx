@@ -5,27 +5,27 @@ import { api, fmtINR, fmtPct, fmtTime, regimeColor, volColor, actionColor } from
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Activity, TrendingUp, TrendingDown, Pause, AlertTriangle, Wifi, WifiOff } from "lucide-react";
+import { Activity, TrendingUp, TrendingDown, Pause, AlertTriangle, Wifi, WifiOff, AlertCircle } from "lucide-react";
 import { ConfirmationPanel } from "./ConfirmationPanel";
 import { useEffect, useState } from "react";
 
 export function LiveDashboard() {
   // Poll decision every 10s
-  const { data: health } = useQuery({
+  const { data: health, isError: healthError } = useQuery({
     queryKey: ["health"],
     queryFn: api.health,
     refetchInterval: 60000,
     staleTime: 30000,
   });
 
-  const { data: snapshot } = useQuery({
+  const { data: snapshot, isError: snapshotError } = useQuery({
     queryKey: ["snapshot"],
     queryFn: api.snapshot,
     refetchInterval: 60000,
     staleTime: 30000,
   });
 
-  const { data: decision } = useQuery({
+  const { data: decision, isError: decisionError } = useQuery({
     queryKey: ["decision"],
     queryFn: api.decision,
     refetchInterval: 60000,
@@ -46,6 +46,9 @@ export function LiveDashboard() {
     staleTime: 60000,
   });
 
+  // Show error banner if backend is unreachable
+  const backendDown = healthError || snapshotError || decisionError;
+
   const spotChange = snapshot?.index.ltp && snapshot?.index.prev_close
     ? snapshot.index.ltp - snapshot.index.prev_close
     : 0;
@@ -56,6 +59,21 @@ export function LiveDashboard() {
 
   return (
     <div className="space-y-4">
+      {/* Backend error banner */}
+      {backendDown && (
+        <Card className="border-rose-500 bg-rose-50 dark:bg-rose-950/30">
+          <CardContent className="pt-4 flex items-center gap-3 text-sm">
+            <AlertCircle className="h-5 w-5 text-rose-500 flex-shrink-0" />
+            <div>
+              <div className="font-semibold text-rose-700 dark:text-rose-400">Backend Unreachable</div>
+              <div className="text-xs text-rose-600 dark:text-rose-500 mt-0.5">
+                The FastAPI backend on port 8000 is not responding. The dashboard cannot fetch live data.
+                Check if <code className="bg-rose-100 dark:bg-rose-900 px-1 rounded">python scripts/supervisor.py</code> is running.
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
       {/* Top metric cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card>
