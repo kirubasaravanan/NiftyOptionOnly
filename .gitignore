@@ -1,2 +1,12 @@
 skills/
 node_modules/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+runs/
+*.parquet
+*.log
+.DS_Store
+db/

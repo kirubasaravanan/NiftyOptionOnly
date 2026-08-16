@@ -1,0 +1,30 @@
+# DhanHQ broker configuration
+# Broker-specific code is isolated behind BrokerInterface —
+# adding Kite/Angel later only requires implementing the same interface.
+
+dhan:
+  base_url: https://api.dhan.co
+  # Token read from env var DHAN_ACCESS_TOKEN
+  # Client ID read from env var DHAN_CLIENT_ID
+
+  # NIFTY instrument identifiers (Dhan securityId values)
+  # These are filled at runtime by instrument master lookup
+  nifty:
+    exchange_segment: IDX_I                          # Dhan segment for index
+    instrument_token: 13                              # NIFTY 50 index token
+  nifty_futures:
+    enabled: false                                    # Phase later
+  options:
+    underlying: NIFTY
+    lot_size: 75
+    exchange: NSE
+
+# Rate limiting (DhanHQ)
+rate_limit:
+  max_requests_per_second: 5
+  max_requests_per_minute: 200
+  backoff_on_429: true
+
+# Connection
+timeout_seconds: 10
+retry_attempts: 3

@@ -1,0 +1,49 @@
+# Trading hours & time-of-day buckets
+# All times in IST (Asia/Kolkata)
+
+market:
+  exchange: NSE
+  timezone: Asia/Kolkata
+  morning_open: "09:15"
+  morning_close: "15:30"
+  pre_open_start: "09:00"
+  pre_open_end: "09:15"
+  post_close_start: "15:30"
+  holidays:
+    - "2026-08-15"   # Independence Day
+    - "2026-08-16"   # Holiday — system will detect and stay in cash
+
+# Time-of-day buckets — strategy performance will be tracked per bucket
+time_buckets:
+  - name: PRE_OPEN
+    start: "09:00"
+    end: "09:15"
+    trade_allowed: false
+  - name: OPEN
+    start: "09:15"
+    end: "10:30"
+    trade_allowed: true
+  - name: MORNING
+    start: "10:30"
+    end: "12:30"
+    trade_allowed: true
+  - name: MIDDAY
+    start: "12:30"
+    end: "13:30"
+    trade_allowed: true
+    # midday chop — system applies stricter thresholds
+    threshold_multiplier: 1.25
+  - name: AFTERNOON
+    start: "13:30"
+    end: "14:45"
+    trade_allowed: true
+  - name: CLOSING
+    start: "14:45"
+    end: "15:20"
+    trade_allowed: true
+    # avoid new positions too close to close
+    no_new_entries_after: "15:10"
+  - name: POST_CLOSE
+    start: "15:30"
+    end: "16:00"
+    trade_allowed: false

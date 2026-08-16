@@ -1,0 +1,34 @@
+# Strategy enablement & thresholds
+# Strategies are disabled by default — enable only after validation.
+
+strategies:
+  long_call:
+    enabled: true
+    min_expected_net_value: 500      # INR — below this, NO-TRADE
+    min_confidence_score: 0.55
+    min_risk_reward: 1.2
+  long_put:
+    enabled: true
+    min_expected_net_value: 500
+    min_confidence_score: 0.55
+    min_risk_reward: 1.2
+  long_straddle:
+    enabled: false                   # Phase 11
+    min_expected_net_value: 800
+    min_confidence_score: 0.60
+  long_strangle:
+    enabled: false                   # Phase 11
+  debit_spread:
+    enabled: false                   # Phase 10
+  iron_condor:
+    enabled: false                   # Phase 12
+  butterfly:
+    enabled: false                   # Phase 12
+  no_trade:
+    enabled: true                    # ALWAYS enabled — NO-TRADE is a valid decision
+
+# Strategy switching — prevent thrashing
+switching:
+  min_hold_minutes: 15              # don't switch within 15min of last entry
+  cooldown_after_exit_minutes: 10
+  max_switches_per_day: 4

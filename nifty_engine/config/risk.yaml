@@ -1,0 +1,33 @@
+# Risk engine configuration
+# All thresholds configurable — NEVER hard-coded in strategy code.
+# Adjust only after walk-forward validation (Phase 7).
+
+capital:
+  default: 1000000           # INR
+  configurable_scaling_ladder: [200000, 500000, 1000000, 1500000, 2000000]
+
+per_trade:
+  max_risk_pct: 1.5           # max % of capital risked per trade
+  max_premium_pct: 3.0        # max % of capital in premium (long options)
+
+daily:
+  max_loss_pct: 3.0           # hard daily loss limit (hit -> emergency stop)
+  max_trades: 6               # cap to prevent over-trading
+  max_consecutive_losses: 3   # triggers cooldown
+
+portfolio:
+  max_open_positions: 2
+  max_exposure_pct: 6.0       # total premium exposure cap
+
+cooldown:
+  after_consecutive_losses: 3
+  duration_minutes: 60
+
+emergency_shutdown:
+  stale_data_seconds: 30
+  abnormal_spread_ticks: 20   # in NIFTY points
+  api_failure_retries: 3
+
+# The system NEVER allows martingale / averaging into losers
+no_martingale: true
+no_averaging_losers: true

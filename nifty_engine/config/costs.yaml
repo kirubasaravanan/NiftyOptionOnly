@@ -1,0 +1,37 @@
+# Transaction cost model — NSE NIFTY options
+# All rates current as of FY25-26. Update if regulator revises.
+# Every backtest & live trade MUST apply these — never report gross P&L as profit.
+
+brokerage:
+  # Per order flat — Dhan charges ₹20 per executed order for options
+  per_order: 20
+  cap_per_order: 20              # INR cap
+
+stt:
+  # Securities Transaction Tax — options: charged on both buy AND sell side
+  # Buy side: 0.0625% of premium; Sell side (exercised/assigned): 0.125% of strike
+  options_buy_pct_of_premium: 0.000625
+  options_sell_pct_of_premium: 0.000625     # on premium for normal sell
+  options_sell_exercised_pct_of_strike: 0.00125
+
+exchange_transaction_charges:
+  # NSE derivatives — options: 0.0448% of premium (sell side, rounded)
+  options_pct_of_premium: 0.000448
+
+gst:
+  # 18% on (brokerage + SEBI + exchange charges)
+  rate: 0.18
+
+sebi_charges:
+  # ₹10 per crore of turnover
+  per_crore: 10
+
+stamp_duty:
+  # Buyer side only — options: 0.003% of premium
+  options_buy_pct_of_premium: 0.00003
+
+slippage:
+  # Conservative default — tuned by backtest (Phase 6)
+  # In NIFTY points on the option premium
+  per_leg_points: 1.0
+  bid_ask_spread_points: 1.0   # additional spread cost applied on top

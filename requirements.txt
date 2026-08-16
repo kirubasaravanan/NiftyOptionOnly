@@ -1,0 +1,16 @@
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pyyaml>=6.0
+rich>=13.7.0
+
+# Data / numerics
+pandas>=2.1.0
+numpy>=1.26.0
+pyarrow>=14.0.0  # parquet for historical cache
+
+# DhanHQ broker adapter (real data only; no synthetic)
+dhanhq>=2.2.0
+
+# Backtesting (Phase 6 wiring; not used in Phase 1-5 hot path)
+# kept optional so cold start remains light
