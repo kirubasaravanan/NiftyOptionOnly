@@ -16,7 +16,7 @@ dhan:
     enabled: false                                    # Phase later
   options:
     underlying: NIFTY
-    lot_size: 75
+    lot_size: 75                # SINGLE SOURCE OF TRUTH — read by all strategies
     exchange: NSE
 
 # Rate limiting (DhanHQ)

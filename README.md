@@ -222,6 +222,37 @@ Or use the **Backtest** and **Ablation** tabs in the UI.
 - Profit factor: 5.18, Sharpe: 2.66, Max DD: 2.95%
 - All NET of brokerage + STT + GST + slippage
 
+### ⚠️ Backtest Limitations — Read Before Sizing Capital
+
+The backtest numbers above are built on **synthesized data** for non-spot
+instruments. Specifically:
+
+1. **Option chain is synthesized** — DhanHQ does not expose historical option
+   Greeks. The backtest generates the option chain using Black-Scholes with
+   a flat 15% IV and fixed 7-day expiry. Real IV varies by strike and time.
+
+2. **Bank Nifty and NIFTY futures are synthesized** — derived from NIFTY's
+   own move with random noise (85% correlation, 15% divergence).
+
+3. **India VIX is synthesized** — derived from ATR with iv_percentile
+   hardcoded to 50 (neutral).
+
+4. **Same-bar decide-and-fill** — each bar's decision uses that bar's close,
+   and the fill happens at that same close. No live system can do this.
+
+5. **Theta decay is disabled** — open positions are repriced using a constant
+   t = 7/365 regardless of actual holding time. Long-premium strategies
+   (the only ones in the current backtest) never lose value to time decay.
+
+6. **Walk-forward doesn't optimize** — the TRAIN window is fetched but never
+   used. This is N independent windowed backtests, not real walk-forward
+   validation.
+
+**Do not size real capital based on the current backtest report.** The numbers
+are useful for relative comparison (does feature X improve over baseline?) but
+not for absolute expectancy. Fix requires historical option-chain data from
+DhanHQ (or a third-party provider) — tracked as a Phase 6 enhancement.
+
 ## Important Restrictions (per spec)
 
 - ❌ NO martingale / averaging into losers

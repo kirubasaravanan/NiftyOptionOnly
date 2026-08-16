@@ -131,22 +131,36 @@ else
 fi
 
 # 启动 FastAPI 后端 (NIFTY Engine API)
-if [ -f "../scripts/supervisor.py" ]; then
-    echo "🚀 启动 FastAPI 后端 (NIFTY Engine)..."
-    cd "$BUILD_DIR/.."
+# In the packaged build, Python source lives at next-service-dist/scripts/supervisor.py
+# In a raw git checkout, it lives at scripts/supervisor.py (one level up from BUILD_DIR).
+# Check both locations.
+BACKEND_DIR=""
+if [ -f "$BUILD_DIR/next-service-dist/scripts/supervisor.py" ]; then
+    BACKEND_DIR="$BUILD_DIR/next-service-dist"
+elif [ -f "$BUILD_DIR/../scripts/supervisor.py" ]; then
+    BACKEND_DIR="$BUILD_DIR/.."
+fi
+
+if [ -n "$BACKEND_DIR" ]; then
+    echo "🚀 启动 FastAPI 后端 (NIFTY Engine) — found at $BACKEND_DIR"
+    cd "$BACKEND_DIR"
+    # Ensure nifty_engine package is importable (it's a sibling of scripts/)
+    export PYTHONPATH="$BACKEND_DIR${PYTHONPATH:+:$PYTHONPATH}"
     python -u scripts/supervisor.py > "$BUILD_DIR/api.log" 2>&1 &
     API_PID=$!
     pids="$pids $API_PID"
     
     sleep 2
     if ! kill -0 "$API_PID" 2>/dev/null; then
-        echo "❌ FastAPI 后端启动失败"
+        echo "❌ FastAPI 后端启动失败 (check $BUILD_DIR/api.log)"
     else
         echo "✅ FastAPI 后端已启动 (PID: $API_PID, Port: 8000)"
     fi
     cd "$BUILD_DIR"
 else
     echo "⚠️  未找到 scripts/supervisor.py — FastAPI 后端将不会启动"
+    echo "    Checked: $BUILD_DIR/next-service-dist/scripts/supervisor.py"
+    echo "    Checked: $BUILD_DIR/../scripts/supervisor.py"
 fi
 
 # 启动 Caddy（如果存在 Caddyfile）

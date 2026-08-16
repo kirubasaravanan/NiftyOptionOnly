@@ -223,10 +223,32 @@ class Engine:
             )
 
         # ---- 8. compose decision ----
+        # CRITICAL: Enforce no_martingale / no_averaging_losers in live/paper.
+        # The PositionManager has this logic but was only called from backtest.
+        # Now we check: if any open position is losing, block new entries in
+        # the same direction (no averaging down).
+        new_position_blocked = False
+        block_reason = ""
+        if chosen_eval.eligible and self.order_manager.positions:
+            for p in self.order_manager.positions:
+                if p.status != "OPEN":
+                    continue
+                if p.unrealised_pnl < 0:
+                    # Position is losing — check if new entry is same direction
+                    pos_direction = "BULLISH" if p.strategy == StrategyName.LONG_CALL else "BEARISH" if p.strategy == StrategyName.LONG_PUT else None
+                    if pos_direction and chosen_eval.direction == pos_direction:
+                        new_position_blocked = True
+                        block_reason = (
+                            f"BLOCKED: no_martingale — open {p.strategy.value} position "
+                            f"is losing (₹{p.unrealised_pnl:,.0f}), cannot add same-direction"
+                        )
+                        break
+
         if (chosen_eval.eligible
                 and opt_sel and opt_sel.selected
                 and risk_decision is not None
-                and risk_decision.allowed):
+                and risk_decision.allowed
+                and not new_position_blocked):
             action = DecisionAction.ENTER
             option = opt_sel.option
             lots = risk_decision.max_lots
@@ -315,6 +337,8 @@ class Engine:
                 reasons.append("option selection failed")
             if (risk_decision and not risk_decision.allowed):
                 reasons.append(f"risk blocked: {risk_decision.reason}")
+            if new_position_blocked:
+                reasons.append(block_reason)
             confidence = chosen_eval.confidence_score
 
         # ---- 9. compose final Decision ----
@@ -405,7 +429,16 @@ class Engine:
         self.mae_mfe.init_at_entry(pos)
 
     def _manage_open_positions(self, snapshot, regime, confirmation, now):
-        """Run thesis + 3-layer protection + MAE/MFE on all open positions."""
+        """Run thesis + 3-layer protection + MAE/MFE on all open positions.
+
+        FIX: For spreads, unrealised P&L is now computed from net-debit change
+        (long_leg_current - short_leg_current - entry_net_debit), not from
+        single-leg premium. This ensures Layer-1's ₹5,000/50% hard stop
+        actually fires on a losing spread.
+
+        FIX: Trackers (thesis/protection/MAE-MFE) are now per-position dicts
+        to avoid collision when 2 positions are open simultaneously.
+        """
         if not self.order_manager.positions:
             return
 
@@ -413,34 +446,83 @@ class Engine:
             if pos.status != "OPEN":
                 continue
 
+            # Get or create per-position trackers
+            pos_key = id(pos)
+            if not hasattr(self, '_position_trackers'):
+                self._position_trackers = {}
+            if pos_key not in self._position_trackers:
+                # Lazy-init trackers for this position if not already done
+                self._position_trackers[pos_key] = {
+                    'thesis': ThesisTracker(),
+                    'protection': ProtectionLayer(),
+                    'mae_mfe': MAEMFETracker(),
+                }
+                # Initialise them
+                if confirmation:
+                    direction = "BULLISH" if pos.strategy.value in ("LONG_CALL", "DEBIT_SPREAD") and (pos.option and pos.option.option_type.value == "CE") else "BEARISH"
+                    self._position_trackers[pos_key]['thesis'].init_at_entry(
+                        snapshot, regime, confirmation, direction,
+                    )
+                self._position_trackers[pos_key]['protection'].init_at_entry(pos, snapshot)
+                self._position_trackers[pos_key]['mae_mfe'].init_at_entry(pos)
+
+            trackers = self._position_trackers[pos_key]
+            thesis_tracker = trackers['thesis']
+            protection = trackers['protection']
+            mae_mfe = trackers['mae_mfe']
+
             # Update swing high/low
-            self.protection.update_swing(snapshot)
+            protection.update_swing(snapshot)
 
             # Update mark-to-market
             current_price = pos.current_price or pos.entry_price
             if hasattr(snapshot, "index") and snapshot.index.ltp > 0:
-                # Reprice via BS for paper mode (simplified)
                 try:
                     from .backtest.engine import bs_option_price
                     t = 7.0 / 365.0
-                    new_price = bs_option_price(
-                        snapshot.index.ltp, pos.option.strike, t,
-                        pos.option.iv or 0.15, 0.07, pos.option.option_type,
-                    )
-                    current_price = max(0.05, new_price)
-                    pos.current_price = current_price
-                    pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * 75
+
+                    # FIX: For spreads, compute net-debit current price
+                    # using BOTH legs, not just the long leg.
+                    if pos.long_leg is not None and pos.short_leg is not None:
+                        # Reprice both legs via BS
+                        long_current = bs_option_price(
+                            snapshot.index.ltp, pos.long_leg.strike, t,
+                            pos.long_leg.iv or 0.15, 0.07, pos.long_leg.option_type,
+                        )
+                        short_current = bs_option_price(
+                            snapshot.index.ltp, pos.short_leg.strike, t,
+                            pos.short_leg.iv or 0.15, 0.07, pos.short_leg.option_type,
+                        )
+                        long_current = max(0.05, long_current)
+                        short_current = max(0.05, short_current)
+                        # Net debit = long - short (what we'd pay to close)
+                        current_net_debit = max(0.01, long_current - short_current)
+                        pos.long_leg_current = long_current
+                        pos.short_leg_current = short_current
+                        pos.current_price = current_net_debit
+                        # P&L = (current net debit - entry net debit) * qty
+                        pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * 75
+                        current_price = current_net_debit
+                    else:
+                        # Single-leg: reprice via BS
+                        new_price = bs_option_price(
+                            snapshot.index.ltp, pos.option.strike, t,
+                            pos.option.iv or 0.15, 0.07, pos.option.option_type,
+                        )
+                        current_price = max(0.05, new_price)
+                        pos.current_price = current_price
+                        pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * 75
                 except Exception:
                     pass
 
             # Update MAE/MFE
-            self.mae_mfe.update(pos, current_price, snapshot.index.ltp, now)
+            mae_mfe.update(pos, current_price, snapshot.index.ltp, now)
 
             # Compute current thesis score
             thesis_score = None
             thesis_composite = None
-            if self.thesis_tracker and confirmation:
-                thesis = self.thesis_tracker.update(snapshot, regime, confirmation)
+            if confirmation:
+                thesis = thesis_tracker.update(snapshot, regime, confirmation)
                 thesis_score = thesis
                 thesis_composite = thesis.composite
 
@@ -451,7 +533,7 @@ class Engine:
                             AlertType.THESIS_DETERIORATING,
                             f"Thesis Deteriorating — {pos.strategy.value}",
                             fields={
-                                "Position": pos.option.symbol,
+                                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                 "Direction": thesis.direction,
                                 "Previous State": thesis.changed_from.value,
                                 "Current State": thesis.state.value,
@@ -477,8 +559,8 @@ class Engine:
                             description="Thesis score has dropped into REDUCE zone. Engine is reducing position size to limit further loss if thesis continues to deteriorate.",
                         )
 
-            # Evaluate 3-layer protection
-            protection_result = self.protection.evaluate(
+            # Evaluate 3-layer protection (per-position)
+            protection_result = protection.evaluate(
                 pos, snapshot, thesis_composite, now,
             )
 
@@ -488,6 +570,9 @@ class Engine:
                                     reason=protection_result.trigger.value,
                                     protection_result=protection_result,
                                     thesis_score=thesis_score)
+                # Clean up trackers for this position
+                if hasattr(self, '_position_trackers') and pos_key in self._position_trackers:
+                    del self._position_trackers[pos_key]
 
     def _exit_position(self, pos, exit_price, snapshot, now, reason, protection_result=None, thesis_score=None):
         """Close a position and emit EXIT + TRADE_REVIEW alerts.
@@ -533,8 +618,13 @@ class Engine:
         self.risk.record_trade_result(net, now)
         self.risk.release_open_exposure(pos.entry_price * qty)
 
-        # Finalize MAE/MFE
-        mae_mfe_record = self.mae_mfe.finalize(pos, actual_exit_price, net)
+        # Finalize MAE/MFE (use per-position tracker if available, else fallback)
+        pos_key = id(pos)
+        if hasattr(self, '_position_trackers') and pos_key in self._position_trackers:
+            mae_mfe = self._position_trackers[pos_key]['mae_mfe']
+        else:
+            mae_mfe = self.mae_mfe  # fallback to singleton (legacy)
+        mae_mfe_record = mae_mfe.finalize(pos, actual_exit_price, net)
 
         # Emit EXIT alert
         self.notifier.send_alert(
