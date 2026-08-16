@@ -15,7 +15,7 @@ from .config import load as load_config
 from .data import DhanBroker, MarketCache
 from .decision import (
     OptionSelector, PositionManager, RegimeEngineRunner,
-    RiskEngine, StrategySelector,
+    RiskEngine, StrategySelector, SpreadSelector,
 )
 from .execution import OrderManager, OrderRequest, Reconciler
 from .features.correlation import (
@@ -60,6 +60,7 @@ class Engine:
         self.regime = RegimeEngineRunner()
         self.selector = StrategySelector()
         self.option_selector = OptionSelector()
+        self.spread_selector = SpreadSelector()
         self.risk = RiskEngine(capital=self.capital)
         self.position_manager = PositionManager()
         self.order_manager = OrderManager(mode=mode, broker=self.broker if mode == RunMode.LIVE else None)
@@ -176,11 +177,27 @@ class Engine:
                     description="A directional setup has been detected. The engine will enter if all confirmation + risk gates pass on the next cycle.",
                 )
 
-        # ---- 6. option selection ----
-        opt_sel = self.option_selector.select(snapshot, chosen_eval)
+        # ---- 6. option selection (single-leg OR spread) ----
+        spread_sel = None
+        opt_sel = None
+        if chosen_eval.strategy == StrategyName.DEBIT_SPREAD:
+            # Use SpreadSelector for 2-leg debit spreads
+            spread_sel = self.spread_selector.select(snapshot, chosen_eval)
+            # Build a synthetic opt_sel so downstream code can use the long leg as the primary option
+            if spread_sel.selected:
+                # For risk engine, we use the long leg + spread's max_loss
+                from .models import OptionSelection
+                opt_sel = OptionSelection(
+                    selected=True,
+                    option=spread_sel.long_leg,
+                    score=spread_sel.score,
+                    reasons=spread_sel.reasons,
+                )
+        else:
+            opt_sel = self.option_selector.select(snapshot, chosen_eval)
 
         # ---- 7. risk evaluation ----
-        if chosen_eval.eligible and opt_sel.selected:
+        if chosen_eval.eligible and opt_sel and opt_sel.selected:
             risk_decision = self.risk.evaluate(
                 snapshot, chosen_eval, opt_sel.option,
                 open_positions=self.order_manager.open_positions_count(),
@@ -190,7 +207,7 @@ class Engine:
             risk_decision = None
 
         # Emit RISK_LIMIT alert if risk blocks an otherwise-eligible setup
-        if (chosen_eval.eligible and opt_sel.selected
+        if (chosen_eval.eligible and opt_sel and opt_sel.selected
                 and risk_decision and not risk_decision.allowed
                 and self.risk._consecutive_losses >= self.risk._cfg["cooldown"]["after_consecutive_losses"]):
             self.notifier.send_alert(
@@ -207,14 +224,33 @@ class Engine:
 
         # ---- 8. compose decision ----
         if (chosen_eval.eligible
-                and opt_sel.selected
+                and opt_sel and opt_sel.selected
                 and risk_decision is not None
                 and risk_decision.allowed):
             action = DecisionAction.ENTER
             option = opt_sel.option
             lots = risk_decision.max_lots
-            premium_per_lot = option.ltp * 75
-            total_premium = premium_per_lot * lots
+
+            # Phase 10: spread-specific fields
+            is_spread = (chosen_eval.strategy == StrategyName.DEBIT_SPREAD
+                         and spread_sel is not None
+                         and spread_sel.selected)
+            long_leg = spread_sel.long_leg if is_spread else None
+            short_leg = spread_sel.short_leg if is_spread else None
+            net_debit = spread_sel.net_debit if is_spread else None
+            spread_width = spread_sel.spread_width if is_spread else None
+            max_loss = spread_sel.max_loss * lots if is_spread else None
+            max_gain = spread_sel.max_gain * lots if is_spread else None
+            breakeven = spread_sel.breakeven if is_spread else None
+
+            if is_spread:
+                # For spreads, premium = net debit * qty
+                premium_per_lot = net_debit * 75
+                total_premium = premium_per_lot * lots
+            else:
+                premium_per_lot = option.ltp * 75
+                total_premium = premium_per_lot * lots
+
             stop = risk_decision.stop_loss
             target = risk_decision.take_profit
             reasons = (
@@ -226,13 +262,20 @@ class Engine:
 
             # ---- execute (paper mode fills immediately) ----
             order_req = OrderRequest(
-                option=option,
+                option=option,            # long leg for spreads
+                long_leg=long_leg,
+                short_leg=short_leg,
                 side="BUY",
                 lots=lots,
                 strategy=chosen_eval.strategy.value,
                 stop_loss=stop,
                 take_profit=target,
                 reason=chosen_eval.strategy.value,
+                net_debit=net_debit,
+                spread_width=spread_width,
+                max_loss=max_loss,
+                max_gain=max_gain,
+                breakeven=breakeven,
             )
             order_result = self.order_manager.submit(order_req)
             if not order_result.success:
@@ -246,18 +289,25 @@ class Engine:
                     f"order filled @ {order_result.fill_price:.2f} "
                     f"(slippage {order_result.slippage_applied:.2f})"
                 )
-                # Initialise Phase 8 trackers
+                # Initialise Phase 8 trackers (use long leg as primary option)
                 self._init_position_trackers(option, lots, snapshot, regime_assessment, confirmation, chosen_eval.direction or "NEUTRAL")
-                # Emit ENTRY alert
-                self._send_entry_alert(option, lots, order_result.fill_price, chosen_eval, risk_decision, snapshot, regime_assessment)
+                # Emit ENTRY alert (with spread details if applicable)
+                self._send_entry_alert(option, lots, order_result.fill_price, chosen_eval, risk_decision, snapshot, regime_assessment,
+                                        long_leg=long_leg, short_leg=short_leg, net_debit=net_debit,
+                                        spread_width=spread_width, max_loss=max_loss, max_gain=max_gain, breakeven=breakeven)
         else:
             action = DecisionAction.NO_TRADE
             option = None
+            long_leg = None
+            short_leg = None
             lots = 0
             premium_per_lot = 0.0
             total_premium = 0.0
             stop = None
             target = None
+            max_loss = None
+            max_gain = None
+            breakeven = None
             reasons = list(chosen_eval.reasons)
             if not chosen_eval.eligible:
                 reasons.append("strategy not eligible")
@@ -275,11 +325,16 @@ class Engine:
             regime=regime_assessment.market_regime,
             volatility=regime_assessment.volatility_regime,
             option=option,
+            long_leg=long_leg,
+            short_leg=short_leg,
             lots=lots,
             premium_per_lot=premium_per_lot,
             total_premium=total_premium,
             expected_net_value=chosen_eval.expected_net_value if chosen_eval else 0.0,
             expected_risk=risk_decision.max_premium_exposure if risk_decision else 0.0,
+            max_loss=max_loss,
+            max_gain=max_gain,
+            breakeven=breakeven,
             confidence=confidence,
             stop_loss=stop,
             take_profit=target,
@@ -506,32 +561,62 @@ class Engine:
         self.thesis_tracker = None
         self._last_alerted_setup = None
 
-    def _send_entry_alert(self, option, lots, fill_price, eval_, risk_decision, snapshot, regime):
-        """Send the ENTRY alert to Discord."""
-        self.notifier.send_alert(
-            AlertType.ENTRY,
-            f"Position Entered — {eval_.strategy.value}",
-            fields={
-                "Strategy": eval_.strategy.value,
-                "Direction": eval_.direction or "NEUTRAL",
+    def _send_entry_alert(self, option, lots, fill_price, eval_, risk_decision, snapshot, regime,
+                          long_leg=None, short_leg=None, net_debit=None,
+                          spread_width=None, max_loss=None, max_gain=None, breakeven=None):
+        """Send the ENTRY alert to Discord (supports both single-leg and spread)."""
+        is_spread = (long_leg is not None and short_leg is not None)
+        fields = {
+            "Strategy": eval_.strategy.value,
+            "Direction": eval_.direction or "NEUTRAL",
+            "Lots": str(lots),
+            "Fill Price": f"₹{fill_price:.2f}",
+            "Premium Paid": f"₹{fill_price * lots * 75:,.0f}",
+            "Stop Loss": f"₹{risk_decision.stop_loss:.2f}" if risk_decision.stop_loss else "—",
+            "Take Profit": f"₹{risk_decision.take_profit:.2f}" if risk_decision.take_profit else "—",
+            "Expected Net": f"₹{eval_.expected_net_value:,.0f}",
+            "Confidence": f"{eval_.confidence_score*100:.0f}%",
+            "Risk/Reward": f"{eval_.risk_reward:.2f}",
+            "NIFTY Spot": f"₹{snapshot.index.ltp:,.0f}",
+            "Regime": regime.market_regime.value,
+            "Volatility": regime.volatility_regime.value,
+        }
+        if is_spread:
+            fields.update({
+                "Structure": "Bull Call Spread" if eval_.direction == "BULLISH" else "Bear Put Spread",
+                "Long Leg": f"{long_leg.symbol} @ ₹{long_leg.ltp:.2f} (strike {long_leg.strike})",
+                "Short Leg": f"{short_leg.symbol} @ ₹{short_leg.ltp:.2f} (strike {short_leg.strike})",
+                "Net Debit": f"₹{net_debit:.2f}/unit",
+                "Spread Width": f"{spread_width}pt",
+                "Max Loss": f"₹{max_loss:,.0f}" if max_loss else "—",
+                "Max Gain": f"₹{max_gain:,.0f}" if max_gain else "—",
+                "Breakeven": f"₹{breakeven:,.0f}" if breakeven else "—",
+            })
+            description = (
+                f"Entered {lots} lot(s) of "
+                f"{'Bull Call Spread' if eval_.direction == 'BULLISH' else 'Bear Put Spread'} "
+                f"at ₹{net_debit:.2f}/unit net debit. "
+                f"Max loss ₹{max_loss:,.0f}, max gain ₹{max_gain:,.0f}, breakeven ₹{breakeven:,.0f}. "
+                f"3-layer protection + thesis tracker + MAE/MFE are now active."
+            )
+        else:
+            fields.update({
                 "Option": option.symbol,
                 "Strike": str(option.strike),
                 "Type": option.option_type.value,
-                "Lots": str(lots),
-                "Fill Price": f"₹{fill_price:.2f}",
-                "Premium Paid": f"₹{fill_price * lots * 75:,.0f}",
-                "Stop Loss": f"₹{risk_decision.stop_loss:.2f}" if risk_decision.stop_loss else "—",
-                "Take Profit": f"₹{risk_decision.take_profit:.2f}" if risk_decision.take_profit else "—",
-                "Expected Net": f"₹{eval_.expected_net_value:,.0f}",
-                "Confidence": f"{eval_.confidence_score*100:.0f}%",
-                "Risk/Reward": f"{eval_.risk_reward:.2f}",
-                "NIFTY Spot": f"₹{snapshot.index.ltp:,.0f}",
-                "Regime": regime.market_regime.value,
-                "Volatility": regime.volatility_regime.value,
                 "IV": f"{option.iv*100:.1f}%" if option.iv else "—",
                 "Delta": f"{option.delta:.2f}" if option.delta else "—",
-            },
-            description=f"Entered {lots} lot(s) of {option.symbol} at ₹{fill_price:.2f}. 3-layer protection + thesis tracker + MAE/MFE are now active.",
+            })
+            description = (
+                f"Entered {lots} lot(s) of {option.symbol} at ₹{fill_price:.2f}. "
+                f"3-layer protection + thesis tracker + MAE/MFE are now active."
+            )
+
+        self.notifier.send_alert(
+            AlertType.ENTRY,
+            f"Position Entered — {eval_.strategy.value}",
+            fields=fields,
+            description=description,
         )
 
     # ---- helpers ----

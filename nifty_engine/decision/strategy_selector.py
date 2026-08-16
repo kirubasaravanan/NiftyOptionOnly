@@ -7,6 +7,9 @@ Decision logic (per spec point 28):
   3. Apply confirmation-score adjustment (Layer 3 features modulate confidence)
   4. Among eligible, pick the one with the highest expected_net_value
   5. If no eligible strategy remains -> NO_TRADE
+
+Phase 10 addition: when VIX is expensive (HIGH_VOL / VOL_EXPANSION), prefer
+DEBIT_SPREAD over outright Long CE/PE because spreads offset IV sensitivity.
 """
 from __future__ import annotations
 
@@ -14,9 +17,9 @@ from typing import Optional
 
 from ..models import (
     Decision, DecisionAction, MarketSnapshot, RegimeAssessment,
-    StrategyEvaluation, StrategyName,
+    StrategyEvaluation, StrategyName, VolatilityRegime,
 )
-from ..strategies import LongCallStrategy, LongPutStrategy, NoTradeStrategy
+from ..strategies import LongCallStrategy, LongPutStrategy, NoTradeStrategy, DebitSpreadStrategy
 from ..utils.time_utils import bucket_threshold_multiplier
 from ..features.correlation import ConfirmationScore
 
@@ -28,6 +31,7 @@ class StrategySelector:
         self._strategies = [
             LongCallStrategy(),
             LongPutStrategy(),
+            DebitSpreadStrategy(),
             NoTradeStrategy(),
         ]
 
@@ -105,7 +109,27 @@ class StrategySelector:
                 no_trade.reasons.extend(confirmation.reasons)
             return no_trade, all_evals
 
-        # Pick highest expected_net_value; tiebreak by confidence
+        # Phase 10: when VIX is expensive, prefer DEBIT_SPREAD over outright long
+        # even if outright long has slightly higher expected_net_value.
+        if regime.volatility_regime in (VolatilityRegime.HIGH_VOL, VolatilityRegime.VOL_EXPANSION):
+            spread_evals = [e for e in eligible if e.strategy == StrategyName.DEBIT_SPREAD]
+            outright_evals = [e for e in eligible if e.strategy in (StrategyName.LONG_CALL, StrategyName.LONG_PUT)]
+            if spread_evals and outright_evals:
+                spread_best = max(spread_evals, key=lambda e: e.expected_net_value)
+                outright_best = max(outright_evals, key=lambda e: e.expected_net_value)
+                # If spread's expected_net is within 80% of outright, prefer spread
+                # (lower IV risk, defined risk profile, smaller theta bleed)
+                if spread_best.expected_net_value >= 0.80 * outright_best.expected_net_value:
+                    spread_best.reasons.append(
+                        f"PREFERRED over {outright_best.strategy.value} in expensive VIX "
+                        f"(spread ₹{spread_best.expected_net_value:.0f} vs outright ₹{outright_best.expected_net_value:.0f})"
+                    )
+                    chosen = spread_best
+                    # Re-sort the remaining eligible list
+                    eligible_filtered = [e for e in eligible if e is not chosen]
+                    return chosen, all_evals
+
+        # Default: pick highest expected_net_value; tiebreak by confidence
         chosen = max(eligible, key=lambda e: (e.expected_net_value, e.confidence_score))
         return chosen, all_evals
 

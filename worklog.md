@@ -149,3 +149,71 @@ Stage Summary:
 - User can verify webhook by clicking "Send Test Alert" in Alerts tab — confirms integration is working
 - Lifecycle test sent 9 alerts covering: REGIME_CHANGE, SETUP_DETECTED, ENTRY, POSITION_UPDATE, THESIS_DETERIORATING, THESIS_INVALIDATED, EXIT, TRADE_REVIEW, STRATEGY_PERFORMANCE
 - When market reopens, real alerts will fire automatically on: regime changes, setup detection, entries, position updates, thesis deterioration, exits (via any of the 3 protection layers), and trade reviews with MAE/MFE analysis
+
+---
+Task ID: 5
+Agent: main (super-z)
+Task: Phase 10 — Debit Spreads (Bull Call Spread + Bear Put Spread). First multi-leg strategy. Per spec section 2: "Use when directional conviction exists + option premium/IV makes outright buying unattractive + defined risk improves expected risk-adjusted return." Also: push to GitHub repo https://github.com/kirubasaravanan/NiftyOptionOnly.git once Phase 10 complete + UI populated + validated.
+
+Work Log:
+- Extended nifty_engine/models/__init__.py:
+  * Added SpreadSelection model (long_leg, short_leg, net_debit, spread_width, max_loss, max_gain, breakeven, score, reasons)
+  * Extended Decision model with long_leg, short_leg, max_loss, max_gain, breakeven fields
+  * Extended Position model with long_leg, short_leg, long_leg_current, short_leg_current, spread_width, max_loss, max_gain, breakeven fields (option field made Optional for backward-compat)
+- Enabled debit_spread strategy in nifty_engine/config/strategies.yaml:
+  * enabled: true
+  * min_expected_net_value: 500
+  * min_confidence_score: 0.55
+  * min_risk_reward: 1.5 (higher than Long CE/PE because reward is capped)
+  * min_spread_width: 50pt, max_spread_width: 200pt
+  * preferred_when_vix_expensive: true
+- Extended nifty_engine/execution/cost_model.py with 2 new methods:
+  * cost_for_spread_round_trip() — full cost breakdown for 2-leg spread (4 individual legs = 2 round-trips)
+  * estimate_spread_round_trip_cost() — quick estimate for strategy evaluation
+  * Brokerage doubles for spreads (₹20 × 4 = ₹80 vs ₹40 for single-leg round-trip)
+- Built nifty_engine/decision/spread_selector.py:
+  * SpreadSelector class — picks optimal 2-leg spread for a directional view
+  * Tries 4 spread widths (50, 100, 150, 200 NIFTY points)
+  * For each width: computes net_debit, max_loss, max_gain, breakeven, R/R
+  * Scores each candidate: R/R (40%) + liquidity (25%) + delta alignment (15%) + width reasonableness (10%) + breakeven proximity (10%)
+  * Picks highest-scoring spread with positive max_gain
+- Built nifty_engine/strategies/debit_spread.py:
+  * DebitSpreadStrategy class implementing StrategyBase
+  * Handles both Bull Call Spread (bullish) and Bear Put Spread (bearish)
+  * Direction determined from regime (STRONG_BULL/BULL/WEAK_BULL/BREAKOUT → BULLISH, otherwise BEARISH)
+  * Eligible vol regimes: NORMAL_VOL, HIGH_VOL, VOL_EXPANSION (spreads need at least normal vol)
+  * Preferred when VIX expensive (offsets IV sensitivity — this is the key advantage over outright Long CE/PE)
+  * Computes expected_net_value using net delta (long_delta - short_delta) * expected_move
+  * Net theta much smaller than outright (short leg pays you)
+  * Higher min_risk_reward threshold (1.5 vs 1.2 for Long CE/PE) because reward is capped
+- Updated nifty_engine/decision/strategy_selector.py:
+  * Added DebitSpreadStrategy to the strategy list
+  * Phase 10 logic: when VIX is expensive (HIGH_VOL / VOL_EXPANSION), prefer DEBIT_SPREAD over outright Long CE/PE if spread's expected_net_value ≥ 80% of outright's
+  * Added reason "PREFERRED over LONG_CALL in expensive VIX" when this rule fires
+- Extended nifty_engine/execution/order_manager.py:
+  * OrderRequest now supports long_leg + short_leg + net_debit + spread_width + max_loss + max_gain + breakeven
+  * Added _paper_fill_spread() method — paper-fills 2-leg spread with slippage on each leg (1pt per leg = 2pt total)
+  * Position model populated with long_leg, short_leg, spread_width, max_loss, max_gain, breakeven
+- Updated nifty_engine/engine.py:
+  * Added spread_selector instance
+  * In run_cycle: when chosen strategy is DEBIT_SPREAD, use SpreadSelector instead of OptionSelector
+  * OrderRequest populated with spread fields when is_spread
+  * _send_entry_alert() updated to show 2 legs (Structure, Long Leg, Short Leg, Net Debit, Spread Width, Max Loss, Max Gain, Breakeven) for spread entries
+  * Decision object includes long_leg, short_leg, max_loss, max_gain, breakeven
+- Updated nifty_engine/api.py:
+  * _serialize_decision() now includes long_leg, short_leg, max_loss, max_gain, breakeven
+  * Made get_cached_snapshot() and get_cached_decision() thread-safe with locks (fixes parallel call crashes)
+- Verified backtest still produces same result (6 Long Call trades, +5.94% return) — DebitSpreadStrategy correctly doesn't fire when VIX is cheap (which is the intended behaviour)
+- Verified SpreadSelector works correctly with test data: picks 200pt width, R/R 2.64, score 0.86
+- All 8 smoke tests pass, ESLint clean
+- Updated README with Phase 1-10 status table + Phase 11-20 roadmap
+- API stable across browser polling (after thread-safety fix)
+
+Stage Summary:
+- Phase 10 complete: Debit Spreads (Bull Call + Bear Put) implemented end-to-end
+- Strategy selector now picks spread over outright when VIX expensive + spread net ≥ 80% of outright
+- 2-leg cost model: ₹80 brokerage (4 legs × ₹20) vs ₹40 for single-leg
+- Position model extended to track both legs independently
+- Discord ENTRY alert shows full spread structure (long leg, short leg, net debit, max loss, max gain, breakeven)
+- Thread-safe caching prevents API crashes on parallel browser polling
+- Ready for git push to github.com/kirubasaravanan/NiftyOptionOnly.git

@@ -52,3 +52,29 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# NIFTY Engine — sensitive + runtime artifacts
+.env
+.env.local
+.env.example.local
+runs/
+*.parquet
+security_id_list.csv
+download/
+agent-ctx/
+.zscripts/
+tool-results/
+upload/
+db/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# JSONL journals (runtime artifacts — not source code)
+runs/**/*.jsonl
+*.log.*
+*.pid

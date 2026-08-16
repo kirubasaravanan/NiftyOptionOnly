@@ -13,8 +13,10 @@ from .base import StrategyBase
 from .long_call import LongCallStrategy
 from .long_put import LongPutStrategy
 from .no_trade import NoTradeStrategy
+from .debit_spread import DebitSpreadStrategy
 
 __all__ = [
     "StrategyBase",
     "LongCallStrategy", "LongPutStrategy", "NoTradeStrategy",
+    "DebitSpreadStrategy",
 ]

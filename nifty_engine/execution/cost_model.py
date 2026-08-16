@@ -145,3 +145,53 @@ class CostModel:
         return self.cost_for_round_trip(
             entry_premium_per_unit, entry_premium_per_unit, quantity,
         ).total
+
+    # ---- Phase 10: multi-leg (spread) cost helpers ----
+    def cost_for_spread_round_trip(
+        self,
+        long_entry: float,
+        long_exit: float,
+        short_entry: float,
+        short_exit: float,
+        quantity: int,
+    ) -> TradeCostBreakdown:
+        """Round-trip cost for a 2-leg spread.
+
+        A spread = Buy long leg + Sell short leg (entry) +
+                    Sell long leg + Buy short leg (exit).
+        So 4 individual legs = 2 round-trips of single-leg cost.
+
+        For NIFTY options this matters because:
+          - Brokerage doubles (₹20 × 4 = ₹80 vs ₹40 for single-leg round-trip)
+          - STT applies on each sell side
+          - Slippage applies to each fill
+        """
+        long_rt = self.cost_for_round_trip(long_entry, long_exit, quantity)
+        short_rt = self.cost_for_round_trip(short_entry, short_exit, quantity)
+        return TradeCostBreakdown(
+            brokerage=long_rt.brokerage + short_rt.brokerage,
+            stt=long_rt.stt + short_rt.stt,
+            exchange_charges=long_rt.exchange_charges + short_rt.exchange_charges,
+            gst=long_rt.gst + short_rt.gst,
+            sebi=long_rt.sebi + short_rt.sebi,
+            stamp_duty=long_rt.stamp_duty + short_rt.stamp_duty,
+            slippage=long_rt.slippage + short_rt.slippage,
+            bid_ask_spread_impact=long_rt.bid_ask_spread_impact + short_rt.bid_ask_spread_impact,
+            total=long_rt.total + short_rt.total,
+        )
+
+    def estimate_spread_round_trip_cost(
+        self,
+        long_premium: float,
+        short_premium: float,
+        quantity: int,
+    ) -> float:
+        """Quick estimate for spread: assume exit premiums ≈ entry premiums.
+
+        Used by DebitSpreadStrategy.evaluate() for expected_net_value calc.
+        """
+        return self.cost_for_spread_round_trip(
+            long_premium, long_premium,
+            short_premium, short_premium,
+            quantity,
+        ).total

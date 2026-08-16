@@ -88,17 +88,29 @@ def get_cached_snapshot():
 
     Each refresh makes 4 broker API calls (NIFTY, VIX, BankNifty, NIFTY futures).
     These are network-bound and ~1-2s each, so cache aggressively.
+
+    Thread-safe via a lock — only one thread refreshes at a time.
     """
     import time
+    import threading
     global _cached_snapshot, _cached_snapshot_ts
+    if not hasattr(get_cached_snapshot, '_lock'):
+        get_cached_snapshot._lock = threading.Lock()
+    lock = get_cached_snapshot._lock
     now = time.time()
-    if _cached_snapshot is None or (now - _cached_snapshot_ts) > SNAPSHOT_TTL_SECONDS:
+    # Fast path: return cached if fresh
+    if _cached_snapshot is not None and (now - _cached_snapshot_ts) <= SNAPSHOT_TTL_SECONDS:
+        return _cached_snapshot
+    # Slow path: acquire lock to refresh
+    with lock:
+        # Double-check after acquiring lock
+        if _cached_snapshot is not None and (time.time() - _cached_snapshot_ts) <= SNAPSHOT_TTL_SECONDS:
+            return _cached_snapshot
         try:
             b = get_broker()
             _cached_snapshot = b.get_snapshot()
-            _cached_snapshot_ts = now
+            _cached_snapshot_ts = time.time()
         except Exception as e:
-            # If broker fails, keep the old snapshot (or None)
             print(f"[snapshot refresh error] {type(e).__name__}: {e}", flush=True)
     return _cached_snapshot
 
@@ -106,21 +118,27 @@ def get_cached_snapshot():
 def get_cached_decision():
     """Get a cached decision (refresh every 30s).
 
-    Engine.run_cycle() creates a new DhanBroker each call which loads the 50MB
-    security list CSV — cache to avoid memory thrash.
+    Thread-safe via a lock.
     """
     import time
+    import threading
     global _cached_decision, _cached_decision_ts
+    if not hasattr(get_cached_decision, '_lock'):
+        get_cached_decision._lock = threading.Lock()
+    lock = get_cached_decision._lock
     now = time.time()
-    if _cached_decision is None or (now - _cached_decision_ts) > DECISION_TTL_SECONDS:
+    if _cached_decision is not None and (now - _cached_decision_ts) <= DECISION_TTL_SECONDS:
+        return _cached_decision
+    with lock:
+        if _cached_decision is not None and (time.time() - _cached_decision_ts) <= DECISION_TTL_SECONDS:
+            return _cached_decision
         try:
-            # Pass the singleton broker so Engine doesn't create its own
             engine = Engine(
                 mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR,
                 broker=get_broker(),
             )
             _cached_decision = engine.run_cycle()
-            _cached_decision_ts = now
+            _cached_decision_ts = time.time()
         except Exception as e:
             print(f"[decision refresh error] {type(e).__name__}: {e}", flush=True)
     return _cached_decision
@@ -529,6 +547,10 @@ def _serialize_decision(d):
         "stop_loss": d.stop_loss,
         "take_profit": d.take_profit,
         "reasons": d.reasons,
+        # Phase 10: spread-specific fields
+        "max_loss": getattr(d, 'max_loss', None),
+        "max_gain": getattr(d, 'max_gain', None),
+        "breakeven": getattr(d, 'breakeven', None),
         "option": {
             "symbol": d.option.symbol,
             "strike": d.option.strike,
@@ -538,6 +560,18 @@ def _serialize_decision(d):
             "delta": d.option.delta,
             "expiry": d.option.expiry.isoformat(),
         } if d.option else None,
+        "long_leg": {
+            "symbol": d.long_leg.symbol,
+            "strike": d.long_leg.strike,
+            "option_type": d.long_leg.option_type.value,
+            "ltp": d.long_leg.ltp,
+        } if getattr(d, 'long_leg', None) else None,
+        "short_leg": {
+            "symbol": d.short_leg.symbol,
+            "strike": d.short_leg.strike,
+            "option_type": d.short_leg.option_type.value,
+            "ltp": d.short_leg.ltp,
+        } if getattr(d, 'short_leg', None) else None,
         "explainability": d.explainability_block,
     }
 

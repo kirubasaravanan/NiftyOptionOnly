@@ -19,7 +19,13 @@ strategies:
   long_strangle:
     enabled: false                   # Phase 11
   debit_spread:
-    enabled: false                   # Phase 10
+    enabled: true                    # Phase 10 — first multi-leg strategy
+    min_expected_net_value: 500
+    min_confidence_score: 0.55
+    min_risk_reward: 1.5            # higher bar than long CE/PE because reward is capped
+    min_spread_width: 50            # NIFTY points between long and short strike
+    max_spread_width: 200           # cap to keep risk reasonable
+    preferred_when_vix_expensive: true   # use spread instead of outright when VIX > 75th pctile
   iron_condor:
     enabled: false                   # Phase 12
   butterfly:

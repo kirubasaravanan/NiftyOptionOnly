@@ -162,11 +162,12 @@ def build():
 
     # ---------- COVER ----------
     story.append(P("Adaptive NIFTY Options Trading System", style_title))
-    story.append(P("Architecture Specification — Phase 1-5", style_subtitle))
+    story.append(P("Architecture Specification — Phase 1-10 (v0.5.0)", style_subtitle))
     story.append(Spacer(1, 6*mm))
     story.append(P(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", style_subtitle))
     story.append(P("Mode: PAPER (no live orders)   |   Broker adapter: DhanHQ (broker-neutral interface)", style_subtitle))
-    story.append(P("Capital: ₹10,00,000 (configurable)   |   Strategies enabled: Long Call, Long Put, NO-TRADE", style_subtitle))
+    story.append(P("Capital: ₹10,00,000 (configurable)   |   Strategies: Long Call, Long Put, Debit Spread, NO-TRADE", style_subtitle))
+    story.append(P("15 Discord alert types   |   3-layer protection   |   Thesis tracker + MAE/MFE   |   Ablation testing", style_subtitle))
     story.append(Spacer(1, 8*mm))
 
     # ---------- 1. OBJECTIVE ----------
@@ -323,22 +324,30 @@ def build():
     ))
 
     # ---------- 16. DEVELOPMENT ORDER ----------
-    story.append(P("16. Development Order", style_h1))
-    story.append(P("The system is built in phases per the spec. Phase 1-5 ships now; later phases add validated strategies.", style_body))
+    story.append(P("16. Development Order + Roadmap to Phase 20", style_h1))
+    story.append(P("Phases 1-10 are complete. Phase 9 is paused per user request (observe Phase 1-8 in paper for 1 week before live capital). Phase 11+ are planned but not yet built.", style_body))
     story.append(table(
         [["Phase", "Scope", "Status"],
-         ["1", "Data ingestion & validation (DhanHQ adapter)", "Done"],
-         ["2", "Local market-data cache (TTL)", "Done"],
-         ["3", "Technical + regime + volatility engine", "Done"],
-         ["4", "Long Call / Long Put + NO-TRADE strategies", "Done"],
-         ["5", "Risk engine + position manager + paper execution", "Done"],
-         ["6", "Backtesting engine + cost model integration", "Pending"],
-         ["7", "Walk-forward validation framework", "Pending"],
-         ["8", "Paper trading with live market data", "Pending (token required)"],
-         ["9", "Live execution with small capital", "Pending"],
-         ["10", "Debit spreads", "Pending"],
-         ["11", "Straddle / strangle evaluation", "Pending"],
-         ["12", "Iron condor / butterfly", "Pending"]],
+         ["1", "Data ingestion & validation (DhanHQ adapter)", "✅ Done"],
+         ["2", "Local market-data cache (TTL)", "✅ Done"],
+         ["3", "Technical + regime + volatility engine", "✅ Done"],
+         ["4", "Long Call / Long Put + NO-TRADE strategies", "✅ Done"],
+         ["5", "Risk engine + position manager + paper execution", "✅ Done"],
+         ["6", "Backtesting engine + cost model integration", "✅ Done"],
+         ["7", "Walk-forward validation + ablation testing", "✅ Done"],
+         ["8", "Paper trading + Discord lifecycle alerts (15 types) + thesis + 3-layer protection + MAE/MFE", "✅ Done"],
+         ["9", "Live execution with small capital", "⏸️ Paused (user chose to observe first)"],
+         ["10", "Debit spreads (Bull Call + Bear Put) — first multi-leg strategy", "✅ Done"],
+         ["11", "Long Straddle / Long Strangle (neutral regime, vol expansion)", "📋 Planned"],
+         ["12", "Iron Condor / Butterfly (range regime, premium selling)", "📋 Planned"],
+         ["13", "Walk-forward parameter grid search (tune thresholds)", "📋 Planned"],
+         ["14", "Live broker reconciliation (order status, fill confirmation)", "📋 Planned"],
+         ["15", "Multi-strategy portfolio allocation", "📋 Planned"],
+         ["16", "Capital scaling ladder (₹2L → ₹20L)", "📋 Planned"],
+         ["17", "Tax reporting (separate STT/exchange/GST breakdown)", "📋 Planned"],
+         ["18", "Walk-forward retraining (rolling re-optimisation)", "📋 Planned"],
+         ["19", "Alternative data (GIFT NIFTY, USDINR, crude, S&P futures)", "📋 Planned"],
+         ["20", "Production hardening (graceful shutdown, monitoring, alerting)", "📋 Planned"]],
         col_widths=[1.5*cm, 9.5*cm, 5*cm],
     ))
 

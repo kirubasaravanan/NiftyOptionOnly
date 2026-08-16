@@ -24,14 +24,22 @@ from ..models import OptionQuote, Position, RunMode
 
 @dataclass
 class OrderRequest:
-    option: OptionQuote
-    side: str                  # "BUY" | "SELL"
-    lots: int
+    option: Optional[OptionQuote] = None     # single-leg
+    long_leg: Optional[OptionQuote] = None   # multi-leg (Phase 10+)
+    short_leg: Optional[OptionQuote] = None  # multi-leg (Phase 10+)
+    side: str = "BUY"
+    lots: int = 1
     lot_size: int = 75
     strategy: str = ""
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     reason: str = ""
+    # For spreads:
+    net_debit: Optional[float] = None          # per unit
+    spread_width: Optional[float] = None
+    max_loss: Optional[float] = None
+    max_gain: Optional[float] = None
+    breakeven: Optional[float] = None
 
 
 @dataclass
@@ -93,8 +101,12 @@ class OrderManager:
 
     # ---- internal ----
     def _paper_fill(self, req: OrderRequest, order_id: str) -> OrderResult:
+        # Phase 10: multi-leg spread
+        if req.long_leg is not None and req.short_leg is not None:
+            return self._paper_fill_spread(req, order_id)
+        # Single-leg
         q = req.option
-        if q.ltp <= 0:
+        if q is None or q.ltp <= 0:
             return OrderResult(
                 success=False, order_id=order_id,
                 error="option LTP invalid — cannot paper-fill",
@@ -122,6 +134,57 @@ class OrderManager:
             fill_price=fill,
             filled_quantity=qty,
             slippage_applied=1.0,
+        )
+
+    def _paper_fill_spread(self, req: OrderRequest, order_id: str) -> OrderResult:
+        """Paper-fill a 2-leg spread.
+
+        For a debit spread:
+          - Buy long leg at ask (we pay)
+          - Sell short leg at bid (we receive)
+          - Net debit = long_fill - short_fill
+        """
+        long_q = req.long_leg
+        short_q = req.short_leg
+        if long_q is None or short_q is None:
+            return OrderResult(success=False, order_id=order_id, error="missing legs")
+        if long_q.ltp <= 0:
+            return OrderResult(success=False, order_id=order_id, error="long leg LTP invalid")
+        if short_q.ltp <= 0:
+            return OrderResult(success=False, order_id=order_id, error="short leg LTP invalid")
+
+        # Apply slippage: we pay 1pt extra on long, receive 1pt less on short
+        long_fill = max(0.05, long_q.ltp + 1.0)
+        short_fill = max(0.05, short_q.ltp - 1.0)
+        net_debit = max(0.01, long_fill - short_fill)
+        qty = req.lots * req.lot_size
+
+        position = Position(
+            strategy=req.strategy if req.strategy else "DEBIT_SPREAD",
+            option=long_q,                         # backward-compat: long leg as primary
+            long_leg=long_q,
+            short_leg=short_q,
+            lots=req.lots,
+            entry_price=net_debit,                  # net debit per unit
+            entry_time=datetime.utcnow(),
+            side="BUY",
+            stop_loss=req.stop_loss,
+            take_profit=req.take_profit,
+            current_price=net_debit,
+            long_leg_current=long_fill,
+            short_leg_current=short_fill,
+            spread_width=req.spread_width,
+            max_loss=req.max_loss,
+            max_gain=req.max_gain,
+            breakeven=req.breakeven,
+            unrealised_pnl=0.0,
+        )
+        self._positions.append(position)
+        return OrderResult(
+            success=True, order_id=order_id,
+            fill_price=net_debit,
+            filled_quantity=qty,
+            slippage_applied=2.0,   # 1pt per leg
         )
 
     def _live_submit(self, req: OrderRequest, order_id: str) -> OrderResult:

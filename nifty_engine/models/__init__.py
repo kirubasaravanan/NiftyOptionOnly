@@ -193,9 +193,23 @@ class StrategyEvaluation(BaseModel):
 
 
 class OptionSelection(BaseModel):
-    """The chosen contract + rationale."""
+    """The chosen contract + rationale (single-leg strategies)."""
     selected: bool
     option: Optional[OptionQuote] = None
+    score: float = 0.0
+    reasons: list[str] = Field(default=list)
+
+
+class SpreadSelection(BaseModel):
+    """The chosen 2-leg spread + rationale (debit spreads, straddles, etc.)."""
+    selected: bool
+    long_leg: Optional[OptionQuote] = None
+    short_leg: Optional[OptionQuote] = None
+    net_debit: float = 0.0           # net premium paid per unit
+    spread_width: float = 0.0        # strike difference between legs
+    max_loss: float = 0.0            # = net_debit * qty (defined risk)
+    max_gain: float = 0.0            # = (spread_width - net_debit) * qty
+    breakeven: float = 0.0           # long strike + net_debit (for call spread)
     score: float = 0.0
     reasons: list[str] = Field(default=list)
 
@@ -207,12 +221,17 @@ class Decision(BaseModel):
     strategy: StrategyName
     regime: MarketRegime
     volatility: VolatilityRegime
-    option: Optional[OptionQuote] = None
+    option: Optional[OptionQuote] = None             # single-leg
+    long_leg: Optional[OptionQuote] = None           # multi-leg (Phase 10+)
+    short_leg: Optional[OptionQuote] = None          # multi-leg (Phase 10+)
     lots: int = 0
     premium_per_lot: float = 0.0
     total_premium: float = 0.0
     expected_net_value: float = 0.0
     expected_risk: float = 0.0
+    max_loss: Optional[float] = None                  # defined risk for spreads
+    max_gain: Optional[float] = None                  # capped reward for spreads
+    breakeven: Optional[float] = None                 # spread breakeven
     confidence: float = 0.0
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -223,16 +242,30 @@ class Decision(BaseModel):
 # ---------- positions & journal ----------
 
 class Position(BaseModel):
-    """Live position in the book (paper or live)."""
+    """Live position in the book (paper or live).
+
+    For single-leg (Long Call/Put): use `option` + `entry_price`.
+    For multi-leg spreads (Phase 10+): use `long_leg` + `short_leg` +
+    `net_debit_per_unit`. The `option` field will be set to the long leg
+    for backward-compat with downstream code that expects a single option.
+    """
     strategy: StrategyName
-    option: OptionQuote
+    option: Optional[OptionQuote] = None            # single-leg OR long leg of spread
+    long_leg: Optional[OptionQuote] = None           # multi-leg (Phase 10+)
+    short_leg: Optional[OptionQuote] = None          # multi-leg (Phase 10+)
     lots: int
-    entry_price: float
+    entry_price: float                                # for single-leg: premium; for spread: net debit
     entry_time: datetime
     side: Literal["BUY", "SELL"] = "BUY"
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
-    current_price: Optional[float] = None
+    current_price: Optional[float] = None            # single-leg current premium OR spread net debit
+    long_leg_current: Optional[float] = None         # multi-leg current long leg premium
+    short_leg_current: Optional[float] = None        # multi-leg current short leg premium
+    spread_width: Optional[float] = None             # multi-leg strike width
+    max_loss: Optional[float] = None                 # defined risk for spreads
+    max_gain: Optional[float] = None                 # capped reward for spreads
+    breakeven: Optional[float] = None                # spread breakeven
     unrealised_pnl: float = 0.0
     status: Literal["OPEN", "EXITED"] = "OPEN"
 
@@ -279,6 +312,6 @@ __all__ = [
     "OptionType", "RunMode", "TimeBucket",
     "OptionQuote", "IndexQuote", "IndiaVIX", "MarketSnapshot",
     "MarketFeatures", "RegimeAssessment",
-    "StrategyEvaluation", "OptionSelection", "Decision",
+    "StrategyEvaluation", "OptionSelection", "SpreadSelection", "Decision",
     "Position", "TradeRecord", "DecisionRecord",
 ]
