@@ -260,6 +260,17 @@ export interface AuxMarketData {
   nifty_futures: { ltp: number; prev_close: number | null; open?: number; high?: number; low?: number } | null;
 }
 
+export interface AlertItem {
+  type: string;
+  title: string;
+  fields: Record<string, string>;
+  description: string | null;
+  timestamp: string;
+  footer: string | null;
+  emoji: string;
+  level: string;
+}
+
 export interface HealthStatus {
   ok: boolean;
   broker_connected: boolean;
@@ -313,6 +324,12 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, content }),
+    }),
+  alerts: (limit = 50) =>
+    fetchJson<{ count: number; items: AlertItem[] }>(`/api/alerts?limit=${limit}`),
+  sendTestAlert: () =>
+    fetchJson<{ ok: boolean; sent: boolean; webhook_configured: boolean; enabled: boolean }>("/api/alerts/test", {
+      method: "POST",
     }),
 };
 

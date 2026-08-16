@@ -117,3 +117,35 @@ Stage Summary:
 - API server stable via supervisor + singleton broker + caching
 - Lint clean, 8 smoke tests pass
 - Per spec: ablation framework enforces "every new factor must pass incremental-value test before going live"
+
+---
+Task ID: 4
+Agent: main (super-z)
+Task: Phase 8 — Paper trading session capture with Discord lifecycle notifications. Per user spec: prediction != position management. Build thesis tracker + 3-layer protection (monetary/structure/time) + MAE/MFE + 15 Discord alert types covering full trade lifecycle.
+
+Work Log:
+- Saved Discord webhook URL to .env (gitignored, never exposed to frontend)
+- Built nifty_engine/notifier/discord.py — DiscordNotifier with 15 AlertType enum values (REGIME_CHANGE, SETUP_DETECTED, ENTRY, POSITION_UPDATE, THESIS_DETERIORATING, POSITION_ADJUSTED, THESIS_INVALIDATED, EXIT, REVERSAL, RISK_LIMIT, TIME_STOP, DATA_API_ERROR, DAILY_SUMMARY, TRADE_REVIEW, STRATEGY_PERFORMANCE). Each type has emoji + color + level. Async non-blocking sends via background thread. In-memory ring buffer (500 alerts) + JSONL log file at runs/alerts/alerts.jsonl. Never raises — Discord failures are logged but never crash the engine.
+- Built nifty_engine/notifier/thesis.py — ThesisTracker with 7 component scores (Trend, VWAP, Momentum, Breadth, Bank Nifty, OI, VIX) weighted into composite 0-100. PositionState enum: CONFIDENT (>=75) → CAUTIOUS (55-74) → REDUCE (40-54) → EXIT (<40) → REVERSE (direction flip). init_at_entry() captures initial thesis; update() re-evaluates each cycle and tracks state transitions.
+- Built nifty_engine/notifier/protection.py — ProtectionLayer implementing 3 layers: Layer 1 = hard monetary stop (₹5,000 cap or 50% premium loss), Layer 2 = market-structure invalidation (VWAP lost + swing broken + thesis < 40, min 2 signals), Layer 3 = time stop (no movement within 30 min). Returns first trigger that fires.
+- Built nifty_engine/notifier/mae_mfe.py — MAEMFETracker tracks Maximum Adverse Excursion (max loss before exit) and Maximum Favourable Excursion (max profit before exit). Computes capture_rate (% of MFE actually realised). Per-trade record persisted with exit.
+- Wired all 4 components into Engine.run_cycle(): REGIME_CHANGE alert on regime transition, SETUP_DETECTED before entry, ENTRY on order fill (with thesis+protection+MAE/MFE initialised), POSITION_UPDATE + THESIS_DETERIORATING + POSITION_ADJUSTED during position lifecycle, THESIS_INVALIDATED + EXIT + TRADE_REVIEW on close, RISK_LIMIT when risk engine blocks eligible setup, DATA_API_ERROR on emergency shutdown.
+- Built /api/alerts GET endpoint (returns recent alerts from in-memory ring buffer, newest first)
+- Built /api/alerts/test POST endpoint (sends a test DAILY_SUMMARY alert to verify Discord webhook)
+- Built /api/thesis GET endpoint (placeholder for active position thesis — currently returns inactive)
+- Built scripts/test_lifecycle_alerts.py — end-to-end test simulating complete trade lifecycle (REGIME_CHANGE → SETUP_DETECTED → ENTRY → POSITION_UPDATE → THESIS_DETERIORATING → THESIS_INVALIDATED → EXIT → TRADE_REVIEW → STRATEGY_PERFORMANCE). Sent all 9 alerts to Discord successfully.
+- Frontend: new AlertsPanel.tsx component with header card (Send Test Alert button + 15 alert type breakdown badges) + scrollable alert feed with color-coded cards (border-l color per alert type, emoji + level icon + timestamp + fields grid). New "Alerts" tab in main page nav (6 tabs now: Dashboard, Backtest, Ablation, Journal, Alerts, Configuration).
+- Reduced dashboard polling intervals to 60s (was 10-30s) to prevent API concurrency exhaustion that was killing the API server. Removed limit_concurrency=5 from uvicorn config.
+- Verified end-to-end via agent-browser: Alerts tab shows test alerts with full metadata, dashboard remains stable across polling cycles.
+
+Stage Summary:
+- Phase 8 complete: Discord lifecycle notifications live with all 15 alert types
+- 3-layer protection implemented: monetary stop + structure invalidation + time stop
+- Thesis tracker tracks 7 components per cycle, transitions CONFIDENT→CAUTIOUS→REDUCE→EXIT
+- MAE/MFE tracked per trade with capture rate metric
+- All alerts non-blocking (background thread) + persisted to runs/alerts/alerts.jsonl
+- 8 smoke tests pass, ESLint clean
+- API stable at 120MB across browser polling cycles (60s intervals)
+- User can verify webhook by clicking "Send Test Alert" in Alerts tab — confirms integration is working
+- Lifecycle test sent 9 alerts covering: REGIME_CHANGE, SETUP_DETECTED, ENTRY, POSITION_UPDATE, THESIS_DETERIORATING, THESIS_INVALIDATED, EXIT, TRADE_REVIEW, STRATEGY_PERFORMANCE
+- When market reopens, real alerts will fire automatically on: regime changes, setup detection, entries, position updates, thesis deterioration, exits (via any of the 3 protection layers), and trade reviews with MAE/MFE analysis

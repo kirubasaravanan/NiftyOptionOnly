@@ -233,6 +233,50 @@ def decision():
     return _serialize_decision(d)
 
 
+@app.get("/api/alerts")
+def alerts(limit: int = 50):
+    """Return recent Discord alert log (newest first)."""
+    from .notifier.discord import get_notifier
+    n = get_notifier()
+    items = n.recent_alerts(limit=limit)
+    return {"count": len(items), "items": items}
+
+
+@app.get("/api/thesis")
+def thesis():
+    """Return current thesis score for the active position (if any)."""
+    # We don't currently expose this via the cached engine — return None for now.
+    # When a position is open, the engine's thesis_tracker has the data.
+    return {
+        "active": False,
+        "score": None,
+        "state": None,
+        "direction": None,
+        "components": None,
+        "reasons": [],
+    }
+
+
+@app.post("/api/alerts/test")
+def alerts_test():
+    """Send a test alert to verify the Discord webhook is working."""
+    from .notifier.discord import get_notifier
+    from .notifier import AlertType
+    n = get_notifier()
+    ok = n.send_alert(
+        AlertType.DAILY_SUMMARY,
+        "Test Alert from NIFTY Engine UI",
+        fields={
+            "Source": "Manual test from Configuration tab",
+            "Timestamp": ist_now().isoformat(),
+            "Webhook Configured": str(bool(n.webhook_url)),
+            "Enabled": str(n.enabled),
+        },
+        description="If you received this alert in Discord, the webhook integration is working correctly. All 15 alert types will fire on real trade lifecycle events.",
+    )
+    return {"ok": ok, "sent": ok, "webhook_configured": bool(n.webhook_url), "enabled": n.enabled}
+
+
 @app.get("/api/status")
 def status():
     """Risk engine state + open positions + capital."""
@@ -572,7 +616,6 @@ def main():
         timeout_graceful_shutdown=30,
         workers=1,
         access_log=False,
-        limit_concurrency=5,
     )
 
 

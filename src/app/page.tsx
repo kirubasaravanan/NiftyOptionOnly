@@ -5,9 +5,10 @@ import { BacktestPanel } from "@/components/backtest/BacktestPanel";
 import { JournalPanel } from "@/components/journal/JournalPanel";
 import { ConfigPanel } from "@/components/config/ConfigPanel";
 import { AblationPanel } from "@/components/ablation/AblationPanel";
+import { AlertsPanel } from "@/components/alerts/AlertsPanel";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Activity, BarChart3, BookOpen, Settings, TrendingUp, FlaskConical } from "lucide-react";
+import { Activity, BarChart3, BookOpen, Settings, TrendingUp, FlaskConical, Bell } from "lucide-react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 
@@ -20,13 +21,14 @@ const queryClient = new QueryClient({
   },
 });
 
-type Tab = "dashboard" | "backtest" | "ablation" | "journal" | "config";
+type Tab = "dashboard" | "backtest" | "ablation" | "journal" | "alerts" | "config";
 
 const TABS: Array<{ id: Tab; label: string; icon: React.ReactNode }> = [
   { id: "dashboard", label: "Live Dashboard", icon: <Activity className="h-4 w-4" /> },
   { id: "backtest", label: "Backtest", icon: <BarChart3 className="h-4 w-4" /> },
   { id: "ablation", label: "Ablation", icon: <FlaskConical className="h-4 w-4" /> },
   { id: "journal", label: "Journal", icon: <BookOpen className="h-4 w-4" /> },
+  { id: "alerts", label: "Alerts", icon: <Bell className="h-4 w-4" /> },
   { id: "config", label: "Configuration", icon: <Settings className="h-4 w-4" /> },
 ];
 
@@ -47,7 +49,7 @@ export default function Home() {
                 <div>
                   <h1 className="text-sm font-bold leading-tight">Adaptive NIFTY Options Engine</h1>
                   <p className="text-[10px] text-muted-foreground leading-tight">
-                    Phase 7 · Paper + Backtest + Walk-forward + Ablation · DhanHQ
+                    Phase 8 · Paper Trading + Lifecycle Alerts + Thesis Tracking · DhanHQ
                   </p>
                 </div>
               </div>
@@ -57,7 +59,7 @@ export default function Home() {
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 mr-1.5 animate-pulse" />
                 Engine Online
               </Badge>
-              <Badge variant="outline" className="text-[10px]">v0.3.0</Badge>
+              <Badge variant="outline" className="text-[10px]">v0.4.0</Badge>
             </div>
           </div>
 
@@ -88,6 +90,7 @@ export default function Home() {
           {tab === "backtest" && <BacktestPanel />}
           {tab === "ablation" && <AblationPanel />}
           {tab === "journal" && <JournalPanel />}
+          {tab === "alerts" && <AlertsPanel />}
           {tab === "config" && <ConfigPanel />}
         </main>
 
@@ -95,13 +98,14 @@ export default function Home() {
         <footer className="border-t mt-auto bg-muted/30">
           <div className="container mx-auto px-4 py-4 text-xs text-muted-foreground flex flex-col md:flex-row md:items-center md:justify-between gap-2">
             <div>
-              Phase 1-7: data · features · regime · Long CE/PE + NO-TRADE · paper · backtest · walk-forward · ablation
+              Phase 1-8: data · features · regime · Long CE/PE + NO-TRADE · paper · backtest · walk-forward · ablation · Discord lifecycle alerts
             </div>
             <div className="flex items-center gap-3 flex-wrap">
               <span><Badge variant="outline" className="text-[10px]">DhanHQ adapter</Badge></span>
               <span><Badge variant="outline" className="text-[10px]">Real data only — no synthetic</Badge></span>
-              <span><Badge variant="outline" className="text-[10px]">NO-TRADE is a valid strategy</Badge></span>
-              <span><Badge variant="outline" className="text-[10px]">Every feature ablation-tested</Badge></span>
+              <span><Badge variant="outline" className="text-[10px]">3-layer protection</Badge></span>
+              <span><Badge variant="outline" className="text-[10px]">Thesis tracker + MAE/MFE</Badge></span>
+              <span><Badge variant="outline" className="text-[10px]">15 Discord alert types</Badge></span>
             </div>
           </div>
         </footer>

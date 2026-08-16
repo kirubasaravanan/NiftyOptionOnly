@@ -26,7 +26,15 @@ from .features.correlation import (
 from .journal import DecisionLogger, TradeLogger
 from .models import (
     Decision, DecisionAction, MarketSnapshot, RunMode, StrategyName,
+    Position, OptionQuote,
 )
+from .notifier import (
+    DiscordNotifier, AlertType, AlertLevel,
+    ThesisTracker, ThesisScore, PositionState,
+    ProtectionLayer, ProtectionConfig, ProtectionResult, ProtectionTrigger,
+    MAEMFETracker, MAEMFERecord,
+)
+from .notifier.discord import get_notifier
 from .utils.time_utils import ist_now, is_trading_allowed_now
 
 
@@ -60,6 +68,14 @@ class Engine:
         self.trade_logger = TradeLogger(runs_dir=runs_dir)
         self.decision_logger = DecisionLogger(runs_dir=runs_dir)
 
+        # --- Phase 8: notifier + thesis + protection + MAE/MFE ---
+        self.notifier = get_notifier()
+        self.thesis_tracker: Optional[ThesisTracker] = None       # active per-position
+        self.protection = ProtectionLayer()
+        self.mae_mfe = MAEMFETracker()
+        self._last_regime: Optional[str] = None
+        self._last_alerted_setup: Optional[str] = None
+
         self._day_initialised: Optional[datetime] = None
 
     # ---- public API ----
@@ -74,10 +90,22 @@ class Engine:
         # ---- 2. reconcile / emergency gate ----
         reconcile = self.reconciler.check_snapshot(snapshot)
         if not reconcile.ok:
+            # Emit DATA_API_ERROR alert if emergency
+            if reconcile.emergency_action == "SHUTDOWN":
+                self.notifier.send_alert(
+                    AlertType.DATA_API_ERROR,
+                    "Emergency Shutdown Triggered",
+                    fields={
+                        "Reason": reconcile.reason,
+                        "Action": reconcile.emergency_action,
+                        "IST Time": now.isoformat(),
+                    },
+                    description="The engine has detected a critical condition (stale data, abnormal spread, API failure) and is entering emergency shutdown. NO-TRADE will be emitted for the rest of the session.",
+                )
             decision = self._no_trade_decision(
                 snapshot, now,
                 reason=f"reconciliation failed: {reconcile.reason}",
-                emergency=reconciler.emergency_action if False else reconcile.emergency_action,
+                emergency=reconcile.emergency_action,
             )
             self.decision_logger.log_decision(decision, self._snapshot_summary(snapshot))
             return decision
@@ -95,12 +123,58 @@ class Engine:
         # ---- 4. assess regime ----
         regime_assessment = self.regime.assess(snapshot)
 
+        # Emit REGIME_CHANGE alert when regime transitions
+        if self._last_regime is not None and regime_assessment.market_regime.value != self._last_regime:
+            self.notifier.send_alert(
+                AlertType.REGIME_CHANGE,
+                f"Regime Change: {self._last_regime} → {regime_assessment.market_regime.value}",
+                fields={
+                    "Previous": self._last_regime,
+                    "Current": regime_assessment.market_regime.value,
+                    "Volatility": regime_assessment.volatility_regime.value,
+                    "Confidence": f"{regime_assessment.confidence*100:.0f}%",
+                    "Spot": f"₹{snapshot.index.ltp:,.0f}",
+                    "ADX": f"{snapshot.index.adx:.1f}" if snapshot.index.adx else "—",
+                    "RSI": f"{snapshot.index.rsi:.1f}" if snapshot.index.rsi else "—",
+                    "Reasons": " | ".join(regime_assessment.reasons[:3]),
+                },
+                description=f"Market regime has shifted from **{self._last_regime}** to **{regime_assessment.market_regime.value}**. Strategy selector will now evaluate candidates for this new regime.",
+            )
+        self._last_regime = regime_assessment.market_regime.value
+
         # ---- 4b. compute cross-market confirmation (Layer 3 + 4) ----
         # Correlation itself is NEVER a buy signal — it modulates confidence.
         confirmation = self._compute_confirmation(snapshot, regime_assessment)
 
+        # ---- 4c. manage open positions (thesis + protection + MAE/MFE) ----
+        # Done BEFORE selecting new strategy so we can exit/reverse first.
+        self._manage_open_positions(snapshot, regime_assessment, confirmation, now)
+
         # ---- 5. select strategy ----
         chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment, confirmation)
+
+        # Emit SETUP_DETECTED alert when an eligible strategy emerges (before entry)
+        if (chosen_eval.eligible
+                and chosen_eval.strategy != StrategyName.NO_TRADE
+                and self.order_manager.open_positions_count() == 0):
+            setup_key = f"{chosen_eval.strategy.value}@{snapshot.index.ltp:.0f}"
+            if setup_key != self._last_alerted_setup:
+                self._last_alerted_setup = setup_key
+                self.notifier.send_alert(
+                    AlertType.SETUP_DETECTED,
+                    f"Setup Detected: {chosen_eval.strategy.value}",
+                    fields={
+                        "Strategy": chosen_eval.strategy.value,
+                        "Direction": chosen_eval.direction or "NEUTRAL",
+                        "NIFTY": f"₹{snapshot.index.ltp:,.0f}",
+                        "Expected Net": f"₹{chosen_eval.expected_net_value:,.0f}",
+                        "Confidence": f"{chosen_eval.confidence_score*100:.0f}%",
+                        "Risk/Reward": f"{chosen_eval.risk_reward:.2f}",
+                        "Regime": regime_assessment.market_regime.value,
+                        "Status": "WAITING FOR CONFIRMATION",
+                    },
+                    description="A directional setup has been detected. The engine will enter if all confirmation + risk gates pass on the next cycle.",
+                )
 
         # ---- 6. option selection ----
         opt_sel = self.option_selector.select(snapshot, chosen_eval)
@@ -114,6 +188,22 @@ class Engine:
             )
         else:
             risk_decision = None
+
+        # Emit RISK_LIMIT alert if risk blocks an otherwise-eligible setup
+        if (chosen_eval.eligible and opt_sel.selected
+                and risk_decision and not risk_decision.allowed
+                and self.risk._consecutive_losses >= self.risk._cfg["cooldown"]["after_consecutive_losses"]):
+            self.notifier.send_alert(
+                AlertType.RISK_LIMIT,
+                "Risk Limit Reached — Cooldown Active",
+                fields={
+                    "Reason": risk_decision.reason,
+                    "Consecutive Losses": self.risk._consecutive_losses,
+                    "Day P&L": f"₹{self.risk._day_pnl:,.0f}",
+                    "Day Trades": self.risk._day_trades,
+                },
+                description="Risk engine has blocked a setup that would otherwise be eligible. Engine is in cooldown — no new entries until cooldown expires.",
+            )
 
         # ---- 8. compose decision ----
         if (chosen_eval.eligible
@@ -156,6 +246,10 @@ class Engine:
                     f"order filled @ {order_result.fill_price:.2f} "
                     f"(slippage {order_result.slippage_applied:.2f})"
                 )
+                # Initialise Phase 8 trackers
+                self._init_position_trackers(option, lots, snapshot, regime_assessment, confirmation, chosen_eval.direction or "NEUTRAL")
+                # Emit ENTRY alert
+                self._send_entry_alert(option, lots, order_result.fill_price, chosen_eval, risk_decision, snapshot, regime_assessment)
         else:
             action = DecisionAction.NO_TRADE
             option = None
@@ -226,6 +320,219 @@ class Engine:
             )
         except Exception:
             return None
+
+    # ---- Phase 8: position management + alerts ----
+
+    def _init_position_trackers(self, option, lots, snapshot, regime, confirmation, direction):
+        """Initialise thesis + protection + MAE/MFE at trade entry."""
+        # Find the just-opened position
+        pos = None
+        for p in self.order_manager.positions:
+            if p.status == "OPEN" and p.option.symbol == option.symbol:
+                pos = p
+                break
+        if pos is None:
+            pos = self.order_manager.positions[-1] if self.order_manager.positions else None
+        if pos is None:
+            return
+
+        # Thesis tracker
+        self.thesis_tracker = ThesisTracker()
+        if confirmation:
+            self.thesis_tracker.init_at_entry(snapshot, regime, confirmation, direction)
+
+        # Protection layer
+        self.protection = ProtectionLayer()
+        self.protection.init_at_entry(pos, snapshot)
+
+        # MAE/MFE
+        self.mae_mfe = MAEMFETracker()
+        self.mae_mfe.init_at_entry(pos)
+
+    def _manage_open_positions(self, snapshot, regime, confirmation, now):
+        """Run thesis + 3-layer protection + MAE/MFE on all open positions."""
+        if not self.order_manager.positions:
+            return
+
+        for pos in list(self.order_manager.positions):
+            if pos.status != "OPEN":
+                continue
+
+            # Update swing high/low
+            self.protection.update_swing(snapshot)
+
+            # Update mark-to-market
+            current_price = pos.current_price or pos.entry_price
+            if hasattr(snapshot, "index") and snapshot.index.ltp > 0:
+                # Reprice via BS for paper mode (simplified)
+                try:
+                    from .backtest.engine import bs_option_price
+                    t = 7.0 / 365.0
+                    new_price = bs_option_price(
+                        snapshot.index.ltp, pos.option.strike, t,
+                        pos.option.iv or 0.15, 0.07, pos.option.option_type,
+                    )
+                    current_price = max(0.05, new_price)
+                    pos.current_price = current_price
+                    pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * 75
+                except Exception:
+                    pass
+
+            # Update MAE/MFE
+            self.mae_mfe.update(pos, current_price, snapshot.index.ltp, now)
+
+            # Compute current thesis score
+            thesis_score = None
+            thesis_composite = None
+            if self.thesis_tracker and confirmation:
+                thesis = self.thesis_tracker.update(snapshot, regime, confirmation)
+                thesis_score = thesis
+                thesis_composite = thesis.composite
+
+                # Alert on state transition (THESIS_DETERIORATING, POSITION_ADJUSTED)
+                if thesis.changed_from:
+                    if thesis.state == PositionState.CAUTIOUS and thesis.changed_from == PositionState.CONFIDENT:
+                        self.notifier.send_alert(
+                            AlertType.THESIS_DETERIORATING,
+                            f"Thesis Deteriorating — {pos.strategy.value}",
+                            fields={
+                                "Position": pos.option.symbol,
+                                "Direction": thesis.direction,
+                                "Previous State": thesis.changed_from.value,
+                                "Current State": thesis.state.value,
+                                "Composite Score": f"{thesis.composite:.0f}/100",
+                                **{k.capitalize(): f"{v:.0f}" for k, v in thesis.to_dict().items() if isinstance(v, (int, float)) and k not in ("composite",)},
+                                "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
+                                "Spot": f"₹{snapshot.index.ltp:,.0f}",
+                                "Action": "HOLD — monitoring for invalidation",
+                            },
+                            description="Thesis score has dropped from CONFIDENT to CAUTIOUS. Engine will tighten stops and watch for further deterioration.",
+                        )
+                    elif thesis.state == PositionState.REDUCE:
+                        self.notifier.send_alert(
+                            AlertType.POSITION_ADJUSTED,
+                            f"Position Reduce — {pos.strategy.value}",
+                            fields={
+                                "Position": pos.option.symbol,
+                                "Lots": pos.lots,
+                                "Composite Score": f"{thesis.composite:.0f}/100",
+                                "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
+                                "Action": "REDUCE — cut exposure",
+                            },
+                            description="Thesis score has dropped into REDUCE zone. Engine is reducing position size to limit further loss if thesis continues to deteriorate.",
+                        )
+
+            # Evaluate 3-layer protection
+            protection_result = self.protection.evaluate(
+                pos, snapshot, thesis_composite, now,
+            )
+
+            # Trigger exit if any layer fires
+            if protection_result.should_exit:
+                self._exit_position(pos, current_price, snapshot, now,
+                                    reason=protection_result.trigger.value,
+                                    protection_result=protection_result,
+                                    thesis_score=thesis_score)
+
+    def _exit_position(self, pos, exit_price, snapshot, now, reason, protection_result=None, thesis_score=None):
+        """Close a position and emit EXIT + TRADE_REVIEW alerts."""
+        # Close via order manager
+        try:
+            self.order_manager.close_position(pos, exit_price)
+        except Exception:
+            pos.status = "EXITED"
+            pos.current_price = exit_price
+
+        # Compute realized P&L
+        qty = pos.lots * 75
+        gross = (exit_price - pos.entry_price) * qty
+        from .execution import CostModel
+        cost = CostModel().cost_for_round_trip(pos.entry_price, exit_price, qty).total
+        net = gross - cost
+
+        # Finalize MAE/MFE
+        mae_mfe_record = self.mae_mfe.finalize(pos, exit_price, net)
+
+        # Emit EXIT alert
+        self.notifier.send_alert(
+            AlertType.EXIT,
+            f"Position Exited — {pos.strategy.value}",
+            fields={
+                "Position": pos.option.symbol,
+                "Entry": f"₹{pos.entry_price:.2f}",
+                "Exit": f"₹{exit_price:.2f}",
+                "Lots": pos.lots,
+                "Gross P&L": f"₹{gross:+,.0f}",
+                "Charges": f"₹{cost:,.0f}",
+                "Net P&L": f"₹{net:+,.0f}",
+                "Exit Reason": reason,
+                "Spot at Exit": f"₹{snapshot.index.ltp:,.0f}",
+            },
+            description=f"Position closed via **{reason}**. Net P&L: ₹{net:+,.0f} after ₹{cost:,.0f} charges.",
+        )
+
+        # Emit TRADE_REVIEW alert with MAE/MFE analysis
+        review_lines = [
+            f"Strategy: {pos.strategy.value}",
+            f"Entry: ₹{pos.entry_price:.2f} → Exit: ₹{exit_price:.2f}",
+            f"Gross P&L: ₹{gross:+,.0f}",
+            f"Charges: ₹{cost:,.0f}",
+            f"Net P&L: ₹{net:+,.0f}",
+            f"MAE (max adverse): ₹{mae_mfe_record.mae_inr:+,.0f} ({mae_mfe_record.mae_pct_of_premium*100:.1f}% of premium)",
+            f"MFE (max favourable): ₹{mae_mfe_record.mfe_inr:+,.0f} ({mae_mfe_record.mfe_pct_of_premium*100:.1f}% of premium)",
+            f"Capture rate: {mae_mfe_record.capture_rate*100:.0f}% of MFE",
+            f"Exit reason: {reason}",
+        ]
+        if thesis_score:
+            review_lines.append(f"Initial thesis composite: —")
+            review_lines.append(f"Exit thesis composite: {thesis_score.composite:.0f}/100 ({thesis_score.state.value})")
+            review_lines.append(f"Direction: {thesis_score.direction}")
+
+        self.notifier.send_alert(
+            AlertType.TRADE_REVIEW,
+            f"Trade Review — {pos.strategy.value} ({'WIN' if net > 0 else 'LOSS'})",
+            fields={
+                "Position": pos.option.symbol,
+                "Net P&L": f"₹{net:+,.0f}",
+                "MAE": f"₹{mae_mfe_record.mae_inr:+,.0f}",
+                "MFE": f"₹{mae_mfe_record.mfe_inr:+,.0f}",
+                "Capture": f"{mae_mfe_record.capture_rate*100:.0f}%",
+                "Exit Reason": reason,
+            },
+            description="\n".join(review_lines),
+        )
+
+        # Reset trackers
+        self.thesis_tracker = None
+        self._last_alerted_setup = None
+
+    def _send_entry_alert(self, option, lots, fill_price, eval_, risk_decision, snapshot, regime):
+        """Send the ENTRY alert to Discord."""
+        self.notifier.send_alert(
+            AlertType.ENTRY,
+            f"Position Entered — {eval_.strategy.value}",
+            fields={
+                "Strategy": eval_.strategy.value,
+                "Direction": eval_.direction or "NEUTRAL",
+                "Option": option.symbol,
+                "Strike": str(option.strike),
+                "Type": option.option_type.value,
+                "Lots": str(lots),
+                "Fill Price": f"₹{fill_price:.2f}",
+                "Premium Paid": f"₹{fill_price * lots * 75:,.0f}",
+                "Stop Loss": f"₹{risk_decision.stop_loss:.2f}" if risk_decision.stop_loss else "—",
+                "Take Profit": f"₹{risk_decision.take_profit:.2f}" if risk_decision.take_profit else "—",
+                "Expected Net": f"₹{eval_.expected_net_value:,.0f}",
+                "Confidence": f"{eval_.confidence_score*100:.0f}%",
+                "Risk/Reward": f"{eval_.risk_reward:.2f}",
+                "NIFTY Spot": f"₹{snapshot.index.ltp:,.0f}",
+                "Regime": regime.market_regime.value,
+                "Volatility": regime.volatility_regime.value,
+                "IV": f"{option.iv*100:.1f}%" if option.iv else "—",
+                "Delta": f"{option.delta:.2f}" if option.delta else "—",
+            },
+            description=f"Entered {lots} lot(s) of {option.symbol} at ₹{fill_price:.2f}. 3-layer protection + thesis tracker + MAE/MFE are now active.",
+        )
 
     # ---- helpers ----
     def _maybe_reset_day(self, now: datetime) -> None:

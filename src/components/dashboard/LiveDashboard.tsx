@@ -14,31 +14,31 @@ export function LiveDashboard() {
   const { data: health } = useQuery({
     queryKey: ["health"],
     queryFn: api.health,
-    refetchInterval: 15000,
+    refetchInterval: 60000,  // 1 min
   });
 
   const { data: snapshot } = useQuery({
     queryKey: ["snapshot"],
     queryFn: api.snapshot,
-    refetchInterval: 30000,  // 30s — server caches for 30s, so this matches
+    refetchInterval: 60000,  // 1 min
   });
 
   const { data: decision } = useQuery({
     queryKey: ["decision"],
     queryFn: api.decision,
-    refetchInterval: 30000,  // 30s — decision is expensive
+    refetchInterval: 60000,  // 1 min
   });
 
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: api.status,
-    refetchInterval: 30000,
+    refetchInterval: 60000,
   });
 
   const { data: performance } = useQuery({
     queryKey: ["performance"],
     queryFn: api.performance,
-    refetchInterval: 60000,  // 1 min — performance is computed from journal
+    refetchInterval: 120000,  // 2 min
   });
 
   const spotChange = snapshot?.index.ltp && snapshot?.index.prev_close
