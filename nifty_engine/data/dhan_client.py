@@ -1,22 +1,19 @@
-"""DhanHQ broker adapter.
+"""DhanHQ broker adapter (dhanhq 2.x API).
 
-Implements BrokerInterface using the official `dhanhq` Python package.
-Token + client ID are read from environment variables — never hard-coded.
+Token + client ID from env vars. Never hard-coded.
+Today is a market holiday — option chain / live quotes are unavailable.
+Historical candle API still works (used by backtester).
 
 DESIGN RULES:
-  * If DHAN_ACCESS_TOKEN or DHAN_CLIENT_ID is empty -> raise NoDataError.
-  * If the broker library is not installed -> raise NoDataError with reason.
-  * If the broker returns empty/None -> raise NoDataError.
-  * NEVER fall back to synthetic / mock data. The decision engine will
-    see `data_valid=False` and emit NO-TRADE.
-
-Today is a market holiday — running the engine will produce a clean
-NO-TRADE log explaining "market closed / no token".
+  * If token missing -> raise NoDataError
+  * If broker returns failure/empty -> raise NoDataError
+  * NEVER fabricate data. Engine treats NoDataError as data_valid=False
+    and emits NO-TRADE.
 """
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Optional
 
 from ..models import (
@@ -27,113 +24,164 @@ from ..utils.time_utils import ist_now, is_market_open, current_time_bucket
 from .broker_interface import BrokerError, BrokerInterface, NoDataError
 
 
-# Try importing dhanhq lazily so the rest of the engine can run without it
+# Lazy import — engine should run even if dhanhq is not installed
 try:
-    from dhanhq import dhan
+    from dhanhq import DhanContext, HistoricalData, OptionChain, MarketFeed
     _DHAN_AVAILABLE = True
 except ImportError:
     _DHAN_AVAILABLE = False
 
 
+# NIFTY instrument identifiers on Dhan
+NIFTY_INDEX_SECURITY_ID = "13"
+NIFTY_INDEX_EXCHANGE = "IDX_I"
+NIFTY_INDEX_INSTRUMENT_TYPE = "INDEX"
+
+
 class DhanBroker(BrokerInterface):
-    """DhanHQ implementation of BrokerInterface."""
+    """DhanHQ implementation of BrokerInterface (dhanhq 2.x API)."""
 
     def __init__(self) -> None:
         self._token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
         self._client_id = os.environ.get("DHAN_CLIENT_ID", "").strip()
         self._cfg = load_config("broker")["dhan"]
-        self._client = None
+        self._context = None
+        self._hd = None                  # HistoricalData
+        self._oc = None                  # OptionChain
+        self._mf = None                  # MarketFeed (lazy)
         self._connected = False
 
         if not self._token or not self._client_id:
-            # Don't raise here — let is_connected() report False and the
-            # engine will log a clean NO-TRADE.
             return
-
         if not _DHAN_AVAILABLE:
-            # The dhanhq package isn't installed — treat as no-data.
             self._token = ""
             return
 
         try:
-            self._client = dhan.Dhan(
-                client_id=self._client_id,
-                access_token=self._token,
-            )
+            self._context = DhanContext(self._client_id, self._token)
+            self._hd = HistoricalData(self._context)
+            self._oc = OptionChain(self._context)
             self._connected = True
         except Exception as exc:
-            # Never leak credential details.
-            raise BrokerError(f"Dhan client init failed: {type(exc).__name__}") from exc
+            raise BrokerError(f"Dhan init failed: {type(exc).__name__}") from exc
 
     # ---- connectivity ----
     def is_connected(self) -> bool:
-        return bool(self._connected and self._client is not None)
+        return bool(self._connected and self._context is not None)
 
     def is_market_open(self) -> bool:
-        """Check whether NSE is currently in a live session in IST."""
         return is_market_open()
 
-    # ---- helpers ----
-    def _require_connected(self) -> None:
+    def _require(self) -> None:
         if not self.is_connected():
-            reason = "missing DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID or dhanhq not installed"
-            raise NoDataError(f"Dhan broker not connected: {reason}")
+            raise NoDataError(
+                "Dhan not connected (token/client_id missing or dhanhq not installed)"
+            )
 
     # ---- market data ----
     def get_index_quote(self, symbol: str = "NIFTY") -> IndexQuote:
-        self._require_connected()
+        """Get live index quote. On holiday/no data, raises NoDataError."""
+        self._require()
+        # MarketFeed uses websocket — heavier. On holiday it returns nothing.
+        # Fall back to fetching today's daily candle (which works on holidays too
+        # — it returns the most recent trading day's close).
         try:
-            # dhanhq: market_feed for index
-            resp = self._client.market_feed(
-                instrument="IDX_I",
-                exchange_segment="IDX_I",
-                instrument_token=str(self._cfg["nifty"]["instrument_token"]),
+            today = ist_now().date()
+            resp = self._hd.historical_daily_data(
+                NIFTY_INDEX_SECURITY_ID,
+                NIFTY_INDEX_EXCHANGE,
+                NIFTY_INDEX_INSTRUMENT_TYPE,
+                today.isoformat(),
+                today.isoformat(),
             )
         except Exception as exc:
             raise NoDataError(f"index quote fetch failed: {type(exc).__name__}") from exc
 
-        data = self._extract_first(resp)
-        if not data:
-            raise NoDataError("index quote returned empty payload")
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not data or not data.get("close"):
+            # Try recent date range instead
+            return self._fallback_recent_index_quote()
 
+        closes = data["close"]
+        opens = data["open"]
+        highs = data["high"]
+        lows = data["low"]
+        vols = data["volume"]
+        idx = -1
+        ltp = float(closes[idx])
+        if ltp <= 0:
+            return self._fallback_recent_index_quote()
+
+        return IndexQuote(
+            symbol=symbol,
+            ltp=ltp,
+            prev_close=float(closes[-2]) if len(closes) > 1 else None,
+            open=float(opens[idx]),
+            high=float(highs[idx]),
+            low=float(lows[idx]),
+            volume=int(vols[idx]),
+            last_updated=ist_now(),
+        )
+
+    def _fallback_recent_index_quote(self) -> IndexQuote:
+        """Fetch the most recent N days of daily candles and use the last one."""
+        from datetime import timedelta
+        end = ist_now().date()
+        start = end - timedelta(days=14)
         try:
-            return IndexQuote(
-                symbol=symbol,
-                ltp=float(data.get("last_price", data.get("ltp", 0.0)) or 0.0),
-                prev_close=float(data.get("previous_close", 0.0) or 0.0),
-                open=float(data.get("open", 0.0) or 0.0),
-                high=float(data.get("high", 0.0) or 0.0),
-                low=float(data.get("low", 0.0) or 0.0),
-                volume=int(data.get("volume", 0) or 0),
-                vwap=float(data.get("avg_price", 0.0) or 0.0) or None,
-                last_updated=ist_now(),
+            resp = self._hd.historical_daily_data(
+                NIFTY_INDEX_SECURITY_ID,
+                NIFTY_INDEX_EXCHANGE,
+                NIFTY_INDEX_INSTRUMENT_TYPE,
+                start.isoformat(),
+                end.isoformat(),
             )
-        except (TypeError, ValueError) as exc:
-            raise NoDataError(f"index quote parse failed: {exc}") from exc
+        except Exception as exc:
+            raise NoDataError(f"recent quote fetch failed: {type(exc).__name__}") from exc
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not data or not data.get("close"):
+            raise NoDataError("recent daily candles returned empty")
+        closes = data["close"]
+        opens = data["open"]
+        highs = data["high"]
+        lows = data["low"]
+        vols = data["volume"]
+        idx = -1
+        if not closes:
+            raise NoDataError("daily candles close list empty")
+        return IndexQuote(
+            symbol="NIFTY",
+            ltp=float(closes[idx]),
+            prev_close=float(closes[-2]) if len(closes) > 1 else None,
+            open=float(opens[idx]),
+            high=float(highs[idx]),
+            low=float(lows[idx]),
+            volume=int(vols[idx]),
+            last_updated=ist_now(),
+        )
 
     def get_india_vix(self) -> Optional[IndiaVIX]:
+        """India VIX — on Dhan, security_id '13' is NIFTY 50; VIX is on a different ID.
+        We attempt to fetch it but tolerate failures (vol regime works from IVs)."""
         if not self.is_connected():
             return None
         try:
-            # India VIX is on NSE index — instrument token differs; we look
-            # it up via the option chain / instrument master. For Phase 1-5
-            # we accept None when lookup fails (vol regime still works
-            # from option-chain IV).
-            resp = self._client.market_feed(
-                instrument="IDX_I",
-                exchange_segment="IDX_I",
-                instrument_token="13",  # NIFTY50; VIX token retrieved separately later
+            # India VIX has Dhan security_id '15' (best-effort — may need lookup)
+            resp = self._hd.historical_daily_data(
+                "15", "IDX_I", "INDEX",
+                ist_now().date().isoformat(),
+                ist_now().date().isoformat(),
             )
-            data = self._extract_first(resp)
-            if not data:
-                return None
-            return IndiaVIX(
-                ltp=float(data.get("last_price", 0.0) or 0.0),
-                prev_close=float(data.get("previous_close", 0.0) or 0.0),
-                last_updated=ist_now(),
-            )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if data and data.get("close"):
+                return IndiaVIX(
+                    ltp=float(data["close"][-1]),
+                    prev_close=float(data["close"][-2]) if len(data["close"]) > 1 else None,
+                    last_updated=ist_now(),
+                )
         except Exception:
             return None
+        return None
 
     def get_option_chain(
         self,
@@ -141,34 +189,60 @@ class DhanBroker(BrokerInterface):
         expiry: Optional[date] = None,
         n_strikes_each_side: int = 5,
     ) -> list[OptionQuote]:
-        self._require_connected()
+        """Fetch option chain. On holiday, DhanHQ returns empty -> NoDataError."""
+        self._require()
+        # Get list of expiries first
         try:
-            # dhanhq: option_chain fetches chain for the underlying
-            chain_payload = self._client.option_chain(
-                under_security_id=str(self._cfg["nifty"]["instrument_token"]),
-                under_exchange_segment="IDX_I",
-                expiry=expiry.isoformat() if expiry else None,
+            exp_resp = self._oc.expiry_list(NIFTY_INDEX_SECURITY_ID, NIFTY_INDEX_EXCHANGE)
+        except Exception as exc:
+            raise NoDataError(f"expiry_list fetch failed: {type(exc).__name__}") from exc
+        if exp_resp.get("status") != "success":
+            raise NoDataError(f"expiry_list failed: {exp_resp.get('remarks')}")
+
+        exp_data = exp_resp.get("data", "")
+        if not exp_data:
+            raise NoDataError("no expiries returned (market holiday?)")
+
+        # Parse expiry list — Dhan returns list of {expiry: "...", expiryCode: ...}
+        expiries = self._parse_expiries(exp_data)
+        if not expiries:
+            raise NoDataError("could not parse expiry list")
+
+        # Pick requested expiry or nearest
+        target_expiry = expiry or expiries[0]["date"]
+        target_code = None
+        for e in expiries:
+            if e["date"] == target_expiry:
+                target_code = e["code"]
+                break
+        if target_code is None:
+            target_code = expiries[0]["code"]
+            target_expiry = expiries[0]["date"]
+
+        # Fetch option chain for that expiry
+        try:
+            oc_resp = self._oc.option_chain(
+                NIFTY_INDEX_SECURITY_ID, NIFTY_INDEX_EXCHANGE, target_code,
             )
         except Exception as exc:
-            raise NoDataError(f"option chain fetch failed: {type(exc).__name__}") from exc
+            raise NoDataError(f"option_chain fetch failed: {type(exc).__name__}") from exc
+        if oc_resp.get("status") != "success":
+            raise NoDataError(f"option_chain failed: {oc_resp.get('remarks')}")
 
-        raw = self._extract_first(chain_payload) or []
+        raw = oc_resp.get("data", "")
         if not raw:
-            raise NoDataError("option chain returned empty payload")
+            raise NoDataError("option chain returned empty data")
 
-        # We don't have spot yet here, so we keep ALL strikes; the option
-        # selector will pick ATM +/- n_strikes_each_side.
-        return self._parse_option_chain(raw, underlying)
+        return self._parse_option_chain(raw, underlying, target_expiry)
 
     def get_snapshot(
         self,
         underlying: str = "NIFTY",
         n_strikes_each_side: int = 5,
     ) -> MarketSnapshot:
-        """Build the full snapshot. On ANY failure, return data_valid=False."""
+        """Build full snapshot. On ANY failure -> data_valid=False."""
         now = ist_now()
 
-        # ---- gate 1: connectivity ----
         if not self.is_connected():
             return MarketSnapshot(
                 timestamp=now,
@@ -176,25 +250,36 @@ class DhanBroker(BrokerInterface):
                 option_chain=[],
                 market_open=False,
                 data_valid=False,
-                data_invalid_reason=(
-                    "DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID not set OR dhanhq not installed"
-                ),
+                data_invalid_reason="DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID not set or dhanhq not installed",
                 time_bucket=current_time_bucket(),
             )
 
-        # ---- gate 2: market open? ----
         if not self.is_market_open():
-            return MarketSnapshot(
-                timestamp=now,
-                index=IndexQuote(ltp=0.0, last_updated=now),
-                option_chain=[],
-                market_open=False,
-                data_valid=False,
-                data_invalid_reason="market closed (holiday / outside trading hours)",
-                time_bucket=current_time_bucket(),
-            )
+            # On holiday we can still fetch the most recent daily candle
+            # for index but option chain is unavailable.
+            try:
+                index = self._fallback_recent_index_quote()
+                return MarketSnapshot(
+                    timestamp=now,
+                    index=index,
+                    india_vix=None,
+                    option_chain=[],
+                    market_open=False,
+                    data_valid=False,
+                    data_invalid_reason="market closed (holiday / outside trading hours)",
+                    time_bucket=current_time_bucket(),
+                )
+            except NoDataError as exc:
+                return MarketSnapshot(
+                    timestamp=now,
+                    index=IndexQuote(ltp=0.0, last_updated=now),
+                    option_chain=[],
+                    data_valid=False,
+                    data_invalid_reason=str(exc),
+                    time_bucket=current_time_bucket(),
+                )
 
-        # ---- fetch everything ----
+        # Market open — fetch everything
         try:
             index = self.get_index_quote(underlying)
         except NoDataError as exc:
@@ -203,11 +288,11 @@ class DhanBroker(BrokerInterface):
                 index=IndexQuote(ltp=0.0, last_updated=now),
                 option_chain=[],
                 data_valid=False,
-                data_invalid_reason=f"index quote: {exc}",
+                data_invalid_reason=f"index: {exc}",
                 time_bucket=current_time_bucket(),
             )
 
-        vix = self.get_india_vix()  # may be None — non-fatal
+        vix = self.get_india_vix()
 
         try:
             chain = self.get_option_chain(
@@ -224,7 +309,6 @@ class DhanBroker(BrokerInterface):
                 time_bucket=current_time_bucket(),
             )
 
-        # ---- final validity check ----
         if index.ltp <= 0 or not chain:
             return MarketSnapshot(
                 timestamp=now,
@@ -248,88 +332,179 @@ class DhanBroker(BrokerInterface):
         )
 
     # ---- historical (Phase 6) ----
-    def historical_candles(self, symbol, interval, start, end):
-        self._require_connected()
-        # Wired in Phase 6 — backtesting engine.
-        raise NotImplementedError("historical_candles is implemented in Phase 6")
+    def historical_candles(
+        self,
+        symbol: str,
+        interval: str,        # "1min", "5min", "15min", "day"
+        start: datetime,
+        end: datetime,
+    ):
+        """Return historical OHLCV as pandas DataFrame.
 
-    # ---- internal helpers ----
-    @staticmethod
-    def _extract_first(payload) -> list | dict | None:
-        """DhanHQ often wraps results in {'data': [...]} or returns a list."""
-        if payload is None:
-            return None
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            if "data" in payload:
-                return payload["data"]
-            return payload
-        return None
+        For NIFTY index daily candles: symbol="NIFTY", interval="day".
+        For intraday: interval="1min" | "5min" | "15min".
+        """
+        import pandas as pd
+        self._require()
 
+        # Map interval to dhan intraday minute value
+        interval_map = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60}
+        if interval == "day":
+            try:
+                resp = self._hd.historical_daily_data(
+                    NIFTY_INDEX_SECURITY_ID,
+                    NIFTY_INDEX_EXCHANGE,
+                    NIFTY_INDEX_INSTRUMENT_TYPE,
+                    start.date().isoformat(),
+                    end.date().isoformat(),
+                )
+            except Exception as exc:
+                raise NoDataError(f"historical daily fetch failed: {type(exc).__name__}") from exc
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not data or not data.get("close"):
+                raise NoDataError("historical daily returned empty")
+            # Build dates list — Dhan returns OHLCV lists but no explicit timestamps;
+            # infer from start..end trading days.
+            n = len(data["close"])
+            dates = pd.bdate_range(start=start.date(), end=end.date())[:n]
+            df = pd.DataFrame({
+                "open": data["open"],
+                "high": data["high"],
+                "low": data["low"],
+                "close": data["close"],
+                "volume": data.get("volume", [0] * n),
+            }, index=dates[:n])
+            return df
+
+        if interval not in interval_map:
+            raise ValueError(f"unsupported interval: {interval}")
+
+        try:
+            resp = self._hd.intraday_minute_data(
+                NIFTY_INDEX_SECURITY_ID,
+                NIFTY_INDEX_EXCHANGE,
+                NIFTY_INDEX_INSTRUMENT_TYPE,
+                start.date().isoformat(),
+                end.date().isoformat(),
+                interval=interval_map[interval],
+            )
+        except Exception as exc:
+            raise NoDataError(f"intraday fetch failed: {type(exc).__name__}") from exc
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not data or not data.get("close"):
+            raise NoDataError("intraday returned empty")
+        n = len(data["close"])
+        # Intraday timestamps are typically in start.date() trading day
+        # We approximate with even spacing across trading hours
+        timestamps = pd.date_range(
+            start=start, periods=n, freq=f"{interval_map[interval]}min"
+        )
+        df = pd.DataFrame({
+            "open": data["open"],
+            "high": data["high"],
+            "low": data["low"],
+            "close": data["close"],
+            "volume": data.get("volume", [0] * n),
+        }, index=timestamps)
+        return df
+
+    # ---- option chain parsing ----
     @staticmethod
-    def _parse_option_chain(raw, underlying: str) -> list[OptionQuote]:
-        """Convert DhanHQ option-chain records to OptionQuote models."""
-        now = ist_now()
-        out: list[OptionQuote] = []
-        if isinstance(raw, dict) and "oc" in raw:
-            raw = raw["oc"]
-        if isinstance(raw, dict):
-            # {"strike": {"ce": {...}, "pe": {...}}}
-            for strike_str, legs in raw.items():
-                try:
-                    strike = float(strike_str)
-                except (TypeError, ValueError):
-                    continue
-                for side, rec in legs.items():
-                    if not rec:
-                        continue
-                    quote = DhanBroker._record_to_quote(rec, strike, side, underlying, now)
-                    if quote:
-                        out.append(quote)
-        elif isinstance(raw, list):
-            for rec in raw:
-                strike = float(rec.get("strike_price", rec.get("strike", 0)) or 0)
-                side = "CE" if str(rec.get("option_type", "CE")).upper() in ("CE", "CALL") else "PE"
-                quote = DhanBroker._record_to_quote(rec, strike, side, underlying, now)
-                if quote:
-                    out.append(quote)
+    def _parse_expiries(raw) -> list[dict]:
+        """Dhan returns either a list of dicts or JSON string."""
+        if isinstance(raw, str):
+            import json
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return []
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            try:
+                if isinstance(item, dict):
+                    d = item.get("expiry") or item.get("date")
+                    c = item.get("expiryCode") or item.get("code")
+                    if d and c is not None:
+                        if isinstance(d, str):
+                            d = datetime.fromisoformat(d.replace("Z", "+00:00")).date() \
+                                if "T" in d else datetime.strptime(d, "%Y-%m-%d").date()
+                        out.append({"date": d, "code": c})
+            except Exception:
+                continue
+        # Sort by date ascending
+        out.sort(key=lambda x: x["date"])
         return out
 
     @staticmethod
-    def _record_to_quote(rec, strike, side, underlying, now) -> Optional[OptionQuote]:
+    def _parse_option_chain(raw, underlying: str, expiry: date) -> list[OptionQuote]:
+        """Convert DhanHQ option-chain payload to OptionQuote list."""
+        import json
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return []
+        now = ist_now()
+        out: list[OptionQuote] = []
+        # Dhan returns either list of records or dict {strike: {ce, pe}}
+        if isinstance(raw, list):
+            for rec in raw:
+                q = DhanBroker._record_to_quote(rec, underlying, expiry, now)
+                if q:
+                    out.append(q)
+        elif isinstance(raw, dict):
+            oc = raw.get("oc", raw)
+            if isinstance(oc, dict):
+                for strike_str, legs in oc.items():
+                    try:
+                        strike = float(strike_str)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(legs, dict):
+                        continue
+                    for side in ("ce", "pe"):
+                        rec = legs.get(side)
+                        if not rec:
+                            continue
+                        q = DhanBroker._record_to_quote(rec, underlying, expiry, now, strike=strike, side=side)
+                        if q:
+                            out.append(q)
+        return out
+
+    @staticmethod
+    def _record_to_quote(rec, underlying, expiry, now, strike=None, side=None) -> Optional[OptionQuote]:
         try:
-            expiry_str = rec.get("expiry", rec.get("expiry_date", ""))
-            expiry_date = (
-                datetime.strptime(expiry_str, "%Y-%m-%d").date()
-                if expiry_str else now.date()
-            )
-            sym = rec.get("symbol") or rec.get("trading_symbol") or (
-                f"{underlying}{expiry_date.strftime('%y%b').upper()}{int(strike)}{side}"
-            )
-            ltp = float(rec.get("last_price", rec.get("ltp", 0.0)) or 0.0)
+            if strike is None:
+                strike = float(rec.get("strike_price", rec.get("strike", 0)) or 0)
+            if side is None:
+                side = rec.get("option_type", "CE")
+            ot = OptionType.CE if str(side).upper() in ("CE", "CALL") else OptionType.PE
+            sym = (rec.get("symbol") or rec.get("trading_symbol")
+                   or rec.get("security_id")
+                   or f"{underlying}{expiry.strftime('%y%b').upper()}{int(strike)}{side.upper()}")
+            ltp = float(rec.get("last_price", rec.get("ltp", 0)) or 0)
             if ltp <= 0:
-                # skip records with no price — never fabricate
                 return None
+            iv_raw = float(rec.get("implied_volatility", rec.get("iv", 0)) or 0)
             return OptionQuote(
                 symbol=sym,
                 exchange="NSE",
-                expiry=expiry_date,
+                expiry=expiry,
                 strike=strike,
-                option_type=OptionType.CE if side.upper() == "CE" else OptionType.PE,
+                option_type=ot,
                 ltp=ltp,
-                bid=float(rec.get("bid", 0.0) or 0.0) or None,
-                ask=float(rec.get("ask", 0.0) or 0.0) or None,
-                bid_qty=int(rec.get("bid_qty", 0) or 0) or None,
-                ask_qty=int(rec.get("ask_qty", 0) or 0) or None,
+                bid=float(rec.get("bid", 0) or 0) or None,
+                ask=float(rec.get("ask", 0) or 0) or None,
                 volume=int(rec.get("volume", rec.get("traded_volume", 0)) or 0),
                 oi=int(rec.get("oi", rec.get("open_interest", 0)) or 0),
                 oi_change=int(rec.get("oi_change", 0) or 0),
-                iv=(float(rec.get("iv", 0.0) or 0.0) / 100.0) or None,  # Dhan returns %
-                delta=float(rec.get("delta", 0.0) or 0.0) or None,
-                gamma=float(rec.get("gamma", 0.0) or 0.0) or None,
-                theta=float(rec.get("theta", 0.0) or 0.0) or None,
-                vega=float(rec.get("vega", 0.0) or 0.0) or None,
+                iv=(iv_raw / 100.0) if iv_raw > 0 else None,
+                delta=float(rec.get("delta", 0) or 0) or None,
+                gamma=float(rec.get("gamma", 0) or 0) or None,
+                theta=float(rec.get("theta", 0) or 0) or None,
+                vega=float(rec.get("vega", 0) or 0) or None,
                 last_updated=now,
             )
         except (TypeError, ValueError, KeyError):

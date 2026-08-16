@@ -23,7 +23,8 @@ class LongCallStrategy(StrategyBase):
 
     # Eligible regimes — strategy is only evaluated when one of these matches
     ELIGIBLE_REGIMES = {
-        MarketRegime.STRONG_BULL, MarketRegime.BULL, MarketRegime.BREAKOUT,
+        MarketRegime.STRONG_BULL, MarketRegime.BULL, MarketRegime.WEAK_BULL,
+        MarketRegime.BREAKOUT,
     }
     ELIGIBLE_VOL = {
         VolatilityRegime.LOW_VOL, VolatilityRegime.NORMAL_VOL,
@@ -33,7 +34,10 @@ class LongCallStrategy(StrategyBase):
     # Expected-move multiplier — ATR-based expected move over holding period.
     # Conservative default; tuned via walk-forward.
     EXPECTED_MOVE_HORIZON_BARS = 6        # ~30min on 5min bars
-    EXPECTED_MOVE_ATR_MULT = 1.0          # capture 1 ATR of expected move
+    EXPECTED_MOVE_ATR_MULT = 1.5          # capture 1.5 ATR of expected move
+    # Risk is the planned stop-loss, NOT the full premium (long options can be
+    # exited before losing 100% of premium).
+    RISK_USING_STOP_FRACTION = 0.50       # risk = 50% of premium (stop-loss proxy)
 
     def evaluate(
         self,
@@ -87,8 +91,8 @@ class LongCallStrategy(StrategyBase):
 
         expected_net = gross_total - cost
 
-        # Risk = total premium paid (long options: max loss = premium)
-        risk = option.ltp * qty
+        # Risk = stop-loss fraction of premium (not full premium — we exit on stop)
+        risk = option.ltp * qty * self.RISK_USING_STOP_FRACTION
         reward = expected_net
         rr = reward / risk if risk > 0 else 0.0
 

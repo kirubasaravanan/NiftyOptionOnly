@@ -19,7 +19,8 @@ class LongPutStrategy(StrategyBase):
     OPTION_TYPE = OptionType.PE
 
     ELIGIBLE_REGIMES = {
-        MarketRegime.STRONG_BEAR, MarketRegime.BEAR, MarketRegime.BREAKOUT,
+        MarketRegime.STRONG_BEAR, MarketRegime.BEAR, MarketRegime.WEAK_BEAR,
+        MarketRegime.BREAKOUT,
     }
     ELIGIBLE_VOL = {
         VolatilityRegime.LOW_VOL, VolatilityRegime.NORMAL_VOL,
@@ -27,7 +28,8 @@ class LongPutStrategy(StrategyBase):
     }
 
     EXPECTED_MOVE_HORIZON_BARS = 6
-    EXPECTED_MOVE_ATR_MULT = 1.0
+    EXPECTED_MOVE_ATR_MULT = 1.5
+    RISK_USING_STOP_FRACTION = 0.50
 
     def evaluate(
         self,
@@ -74,7 +76,7 @@ class LongPutStrategy(StrategyBase):
         cost = self._estimate_cost(option.ltp, qty)
 
         expected_net = gross_total - cost
-        risk = option.ltp * qty
+        risk = option.ltp * qty * self.RISK_USING_STOP_FRACTION
         reward = expected_net
         rr = reward / risk if risk > 0 else 0.0
 
