@@ -133,8 +133,9 @@ class SpreadSelector:
             # Short leg is more expensive than long — not a valid debit spread
             return None
 
-        # 1 lot = 75 units
-        qty = 75
+        # 1 lot = get_lot_size() units
+        from ..utils.config_helpers import get_lot_size
+        qty = get_lot_size()
         max_loss = net_debit * qty           # = total premium paid
         max_gain = (width - net_debit) * qty  # spread value at expiry if ITM
 

@@ -29,7 +29,7 @@ class OrderRequest:
     short_leg: Optional[OptionQuote] = None  # multi-leg (Phase 10+)
     side: str = "BUY"
     lots: int = 1
-    lot_size: int = 75
+    lot_size: int = 75  # default; should be overridden by get_lot_size() at call sites
     strategy: str = ""
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -95,7 +95,7 @@ class OrderManager:
             success=True,
             order_id=f"PAPER-EXIT-{uuid.uuid4().hex[:12]}",
             fill_price=slipped,
-            filled_quantity=position.lots * 75,
+            filled_quantity=position.lots * req.lot_size,
             slippage_applied=1.0,
         )
 
@@ -213,10 +213,19 @@ class OrderManager:
                 continue
             p.current_price = q.ltp
             diff = (q.ltp - p.entry_price) * (1 if p.side == "BUY" else -1)
-            p.unrealised_pnl = diff * p.lots * 75
+            p.unrealised_pnl = diff * p.lots * self._lot_size_for_position(p)
 
     def open_positions_count(self) -> int:
         return sum(1 for p in self._positions if p.status == "OPEN")
+
+    @staticmethod
+    def _lot_size_for_position(_pos) -> int:
+        """Get lot size from config (single source of truth)."""
+        try:
+            from ..utils.config_helpers import get_lot_size
+            return get_lot_size()
+        except Exception:
+            return 75
 
     def total_unrealised_pnl(self) -> float:
         return sum(p.unrealised_pnl for p in self._positions if p.status == "OPEN")

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -477,25 +477,41 @@ def list_configs():
 
 
 @app.put("/api/config/{name}")
-def update_config(name: str, body: ConfigUpdate):
+def update_config(name: str, body: ConfigUpdate, request: Request):
     """Update a YAML config file. Name must match a known file.
 
-    SECURITY: Requires a simple bearer token for write operations.
-    Set ENGINE_API_TOKEN in .env to enable. If not set, writes are
-    allowed only from localhost (X-Forwarded-For check).
+    SECURITY: If ENGINE_API_TOKEN is set in the environment, all write
+    requests must include `Authorization: Bearer <token>` header.
+    If the token is not set, writes are allowed only from localhost.
     """
     from .config import CONFIG_DIR, reload
     import os
+    import secrets
 
-    # Simple auth: require token if ENGINE_API_TOKEN is set
     api_token = os.environ.get("ENGINE_API_TOKEN", "")
     if api_token:
-        # Check Authorization header
-        from fastapi import Request
-        auth = body  # placeholder — FastAPI handles this via dependency injection
-        # In a production system we'd use Depends() with HTTPBearer
-        # For now, just allow from same origin (Next.js rewrite = same machine)
-        pass  # Token check deferred — rely on network-level isolation for now
+        # Require bearer token
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or malformed Authorization header. Expected: Bearer <token>")
+        provided = auth_header[7:]  # strip "Bearer "
+        if not secrets.compare_digest(provided, api_token):
+            raise HTTPException(status_code=401, detail="Invalid API token")
+    else:
+        # No token configured — restrict to localhost only
+        client_host = request.client.host if request.client else ""
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        # Allow localhost / 127.0.0.1 / ::1
+        is_local = (
+            client_host in ("127.0.0.1", "::1", "localhost", "")
+            or forwarded.startswith("127.0.0.1")
+            or forwarded.startswith("::1")
+        )
+        if not is_local:
+            raise HTTPException(
+                status_code=403,
+                detail="Config writes are blocked from non-localhost. Set ENGINE_API_TOKEN to enable remote writes.",
+            )
 
     allowed = {"risk", "strategies", "costs", "trading_hours", "broker"}
     if name not in allowed:

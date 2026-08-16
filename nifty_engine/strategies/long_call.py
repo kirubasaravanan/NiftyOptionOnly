@@ -85,7 +85,8 @@ class LongCallStrategy(StrategyBase):
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
 
         # Quantity: 1 lot for estimation purposes; selector overrides
-        qty = 75
+        from ..utils.config_helpers import get_lot_size
+        qty = get_lot_size()
         gross_total = gross_per_unit * qty
         cost = self._estimate_cost(option.ltp, qty)
 

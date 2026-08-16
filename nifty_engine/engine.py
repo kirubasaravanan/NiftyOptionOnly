@@ -36,6 +36,7 @@ from .notifier import (
 )
 from .notifier.discord import get_notifier
 from .utils.time_utils import ist_now, is_trading_allowed_now
+from .utils.config_helpers import get_lot_size
 
 
 class Engine:
@@ -224,9 +225,9 @@ class Engine:
 
         # ---- 8. compose decision ----
         # CRITICAL: Enforce no_martingale / no_averaging_losers in live/paper.
-        # The PositionManager has this logic but was only called from backtest.
-        # Now we check: if any open position is losing, block new entries in
-        # the same direction (no averaging down).
+        # If any open position is losing, block new entries in the same direction.
+        # This covers LONG_CALL, LONG_PUT, AND DEBIT_SPREAD (both bull call and
+        # bear put spreads — direction derived from the long leg's option type).
         new_position_blocked = False
         block_reason = ""
         if chosen_eval.eligible and self.order_manager.positions:
@@ -234,8 +235,17 @@ class Engine:
                 if p.status != "OPEN":
                     continue
                 if p.unrealised_pnl < 0:
-                    # Position is losing — check if new entry is same direction
-                    pos_direction = "BULLISH" if p.strategy == StrategyName.LONG_CALL else "BEARISH" if p.strategy == StrategyName.LONG_PUT else None
+                    # Derive direction from the position's option type
+                    # For single-leg: option.option_type
+                    # For spreads: long_leg.option_type (same as option for spreads)
+                    opt = p.option or (p.long_leg if p.long_leg else None)
+                    if opt and opt.option_type.value == "CE":
+                        pos_direction = "BULLISH"
+                    elif opt and opt.option_type.value == "PE":
+                        pos_direction = "BEARISH"
+                    else:
+                        pos_direction = None
+
                     if pos_direction and chosen_eval.direction == pos_direction:
                         new_position_blocked = True
                         block_reason = (
@@ -267,10 +277,10 @@ class Engine:
 
             if is_spread:
                 # For spreads, premium = net debit * qty
-                premium_per_lot = net_debit * 75
+                premium_per_lot = net_debit * get_lot_size()
                 total_premium = premium_per_lot * lots
             else:
-                premium_per_lot = option.ltp * 75
+                premium_per_lot = option.ltp * get_lot_size()
                 total_premium = premium_per_lot * lots
 
             stop = risk_decision.stop_loss
@@ -403,30 +413,14 @@ class Engine:
     # ---- Phase 8: position management + alerts ----
 
     def _init_position_trackers(self, option, lots, snapshot, regime, confirmation, direction):
-        """Initialise thesis + protection + MAE/MFE at trade entry."""
-        # Find the just-opened position
-        pos = None
-        for p in self.order_manager.positions:
-            if p.status == "OPEN" and p.option.symbol == option.symbol:
-                pos = p
-                break
-        if pos is None:
-            pos = self.order_manager.positions[-1] if self.order_manager.positions else None
-        if pos is None:
-            return
+        """Legacy entry-point for tracker init.
 
-        # Thesis tracker
-        self.thesis_tracker = ThesisTracker()
-        if confirmation:
-            self.thesis_tracker.init_at_entry(snapshot, regime, confirmation, direction)
-
-        # Protection layer
-        self.protection = ProtectionLayer()
-        self.protection.init_at_entry(pos, snapshot)
-
-        # MAE/MFE
-        self.mae_mfe = MAEMFETracker()
-        self.mae_mfe.init_at_entry(pos)
+        NOTE: Per-position trackers are now created lazily in
+        _manage_open_positions() via self._position_trackers dict.
+        This method is kept for backward-compat but is effectively a no-op
+        — the lazy init in _manage_open_positions handles everything.
+        """
+        pass  # Trackers are lazily initialised per-position in _manage_open_positions
 
     def _manage_open_positions(self, snapshot, regime, confirmation, now):
         """Run thesis + 3-layer protection + MAE/MFE on all open positions.
@@ -501,7 +495,7 @@ class Engine:
                         pos.short_leg_current = short_current
                         pos.current_price = current_net_debit
                         # P&L = (current net debit - entry net debit) * qty
-                        pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * 75
+                        pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * get_lot_size()
                         current_price = current_net_debit
                     else:
                         # Single-leg: reprice via BS
@@ -511,7 +505,7 @@ class Engine:
                         )
                         current_price = max(0.05, new_price)
                         pos.current_price = current_price
-                        pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * 75
+                        pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * get_lot_size()
                 except Exception:
                     pass
 
@@ -591,7 +585,7 @@ class Engine:
         # Compute realized P&L — use exit_price (which includes slippage from
         # close_position) rather than the raw exit_price parameter
         actual_exit_price = pos.current_price or exit_price
-        qty = pos.lots * 75
+        qty = pos.lots * get_lot_size()
 
         # For spreads, P&L is computed differently:
         # gross = (actual_exit_net_debit - entry_net_debit) * qty
@@ -689,7 +683,7 @@ class Engine:
             "Direction": eval_.direction or "NEUTRAL",
             "Lots": str(lots),
             "Fill Price": f"₹{fill_price:.2f}",
-            "Premium Paid": f"₹{fill_price * lots * 75:,.0f}",
+            "Premium Paid": f"₹{fill_price * lots * get_lot_size():,.0f}",
             "Stop Loss": f"₹{risk_decision.stop_loss:.2f}" if risk_decision.stop_loss else "—",
             "Take Profit": f"₹{risk_decision.take_profit:.2f}" if risk_decision.take_profit else "—",
             "Expected Net": f"₹{eval_.expected_net_value:,.0f}",

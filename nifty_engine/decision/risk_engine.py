@@ -118,7 +118,8 @@ class RiskEngine:
         max_premium_per_trade = self._capital * (self._cfg["per_trade"]["max_premium_pct"] / 100.0)
         # For long options, risk == premium
         per_unit_risk = option.ltp
-        lot_size = 75
+        from ..utils.config_helpers import get_lot_size
+        lot_size = get_lot_size()
         # compute max lots
         lots_by_risk = int(max_risk_per_trade // (per_unit_risk * lot_size)) if per_unit_risk > 0 else 0
         lots_by_premium = int(max_premium_per_trade // (per_unit_risk * lot_size)) if per_unit_risk > 0 else 0

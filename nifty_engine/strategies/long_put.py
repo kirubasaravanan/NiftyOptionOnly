@@ -71,7 +71,8 @@ class LongPutStrategy(StrategyBase):
         expected_theta_loss = theta * (self.EXPECTED_MOVE_HORIZON_BARS / 6.0)
 
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
-        qty = 75
+        from ..utils.config_helpers import get_lot_size
+        qty = get_lot_size()
         gross_total = gross_per_unit * qty
         cost = self._estimate_cost(option.ltp, qty)
 
