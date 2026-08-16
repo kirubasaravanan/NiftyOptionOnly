@@ -545,7 +545,7 @@ class Engine:
                             AlertType.POSITION_ADJUSTED,
                             f"Position Reduce — {pos.strategy.value}",
                             fields={
-                                "Position": pos.option.symbol,
+                                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                 "Lots": pos.lots,
                                 "Composite Score": f"{thesis.composite:.0f}/100",
                                 "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
@@ -553,6 +553,27 @@ class Engine:
                             },
                             description="Thesis score has dropped into REDUCE zone. Engine is reducing position size to limit further loss if thesis continues to deteriorate.",
                         )
+                    elif thesis.state == PositionState.REVERSE:
+                        # Direction flip detected — emit REVERSAL alert and exit
+                        self.notifier.send_alert(
+                            AlertType.REVERSAL,
+                            f"Reversal Detected — {pos.strategy.value}",
+                            fields={
+                                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
+                                "Entry Direction": thesis_tracker.entry_direction or "—",
+                                "Current Direction": thesis.direction,
+                                "Composite Score": f"{thesis.composite:.0f}/100",
+                                "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
+                                "Action": "EXIT — direction has flipped",
+                            },
+                            description=f"Regime direction has flipped from {thesis_tracker.entry_direction} to {thesis.direction}. The original thesis is no longer valid — exiting immediately.",
+                        )
+                        # Exit the position
+                        self._exit_position(pos, current_price, snapshot, now,
+                                            reason="REVERSAL",
+                                            protection_result=None,
+                                            thesis_score=thesis_score)
+                        continue  # skip protection check — already exited
 
             # Evaluate 3-layer protection (per-position)
             protection_result = protection.evaluate(
@@ -626,9 +647,9 @@ class Engine:
             AlertType.EXIT,
             f"Position Exited — {pos.strategy.value}",
             fields={
-                "Position": pos.option.symbol,
+                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                 "Entry": f"₹{pos.entry_price:.2f}",
-                "Exit": f"₹{exit_price:.2f}",
+                "Exit": f"₹{actual_exit_price:.2f}",
                 "Lots": pos.lots,
                 "Gross P&L": f"₹{gross:+,.0f}",
                 "Charges": f"₹{cost:,.0f}",
@@ -660,7 +681,7 @@ class Engine:
             AlertType.TRADE_REVIEW,
             f"Trade Review — {pos.strategy.value} ({'WIN' if net > 0 else 'LOSS'})",
             fields={
-                "Position": pos.option.symbol,
+                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                 "Net P&L": f"₹{net:+,.0f}",
                 "MAE": f"₹{mae_mfe_record.mae_inr:+,.0f}",
                 "MFE": f"₹{mae_mfe_record.mfe_inr:+,.0f}",

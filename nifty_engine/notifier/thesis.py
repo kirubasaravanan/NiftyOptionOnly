@@ -128,14 +128,24 @@ class ThesisTracker:
         direction: Optional[str] = None,
         is_entry: bool = False,
     ) -> ThesisScore:
+        # If direction not explicitly passed, derive from current regime
+        # (enables REVERSAL detection on periodic calls)
+        if direction is None:
+            if regime.market_regime.value in ("STRONG_BULL", "BULL", "WEAK_BULL", "BREAKOUT"):
+                direction = "BULLISH"
+            elif regime.market_regime.value in ("STRONG_BEAR", "BEAR", "WEAK_BEAR"):
+                direction = "BEARISH"
+            else:
+                direction = self.entry_direction or "NEUTRAL"
+
         # Compute each component 0-100
-        trend = self._score_trend(snapshot, regime, direction or self.entry_direction or "BULLISH")
-        vwap = self._score_vwap(snapshot, direction or self.entry_direction or "BULLISH")
-        momentum = self._score_momentum(snapshot, regime, direction or self.entry_direction or "BULLISH")
-        breadth = self._score_breadth(confirmation, regime, direction or self.entry_direction or "BULLISH")
-        banknifty = self._score_banknifty(confirmation, direction or self.entry_direction or "BULLISH")
-        oi = self._score_oi(confirmation, direction or self.entry_direction or "BULLISH")
-        vix = self._score_vix(confirmation, direction or self.entry_direction or "BULLISH")
+        trend = self._score_trend(snapshot, regime, direction)
+        vwap = self._score_vwap(snapshot, direction)
+        momentum = self._score_momentum(snapshot, regime, direction)
+        breadth = self._score_breadth(confirmation, regime, direction)
+        banknifty = self._score_banknifty(confirmation, direction)
+        oi = self._score_oi(confirmation, direction)
+        vix = self._score_vix(confirmation, direction)
 
         # Composite — weighted average
         composite = (
@@ -150,7 +160,7 @@ class ThesisTracker:
 
         # Determine state
         prev_state = self.last_state
-        new_state = self._classify_state(composite, direction or self.entry_direction or "BULLISH")
+        new_state = self._classify_state(composite, direction)
 
         # Detect direction flip -> REVERSE
         if (direction and self.entry_direction and direction != self.entry_direction
@@ -176,7 +186,7 @@ class ThesisTracker:
             trend=trend, vwap=vwap, momentum=momentum, breadth=breadth,
             banknifty=banknifty, oi=oi, vix=vix,
             composite=composite, state=new_state,
-            direction=direction or self.entry_direction or "NEUTRAL",
+            direction=direction,
             changed_from=prev_state if (prev_state and prev_state != new_state) else None,
             reasons=reasons,
         )

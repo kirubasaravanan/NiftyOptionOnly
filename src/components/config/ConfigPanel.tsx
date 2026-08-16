@@ -7,8 +7,10 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useState } from "react";
-import { Save, RotateCcw, Loader2, FileText, CheckCircle2, AlertCircle } from "lucide-react";
+import { Save, RotateCcw, Loader2, FileText, CheckCircle2, AlertCircle, Lock } from "lucide-react";
 import { toast } from "sonner";
 
 const CONFIG_ORDER = ["risk", "strategies", "costs", "trading_hours", "broker"];
@@ -23,6 +25,12 @@ export function ConfigPanel() {
   const [activeName, setActiveName] = useState<string>("");
   const [draft, setDraft] = useState<string>("");
   const [touched, setTouched] = useState(false);
+  const [apiToken, setApiToken] = useState<string>("");
+  // Persist token in localStorage so the user doesn't re-enter every session
+  useState(() => {
+    const stored = typeof window !== "undefined" ? localStorage.getItem("engine_api_token") : "";
+    if (stored) setApiToken(stored);
+  });
 
   // Initialise the active config name once when configs first load
   if (configs && !activeName) {
@@ -30,14 +38,17 @@ export function ConfigPanel() {
     setDraft(configs[CONFIG_ORDER[0]] ?? "");
   }
 
-  // When the active name changes (user clicks another file), reset draft
-  // to the saved content unless the user is in the middle of editing.
-  // We use a derived value rather than an effect to avoid setState-in-effect.
   const savedDraft = configs && activeName ? (configs[activeName] ?? "") : "";
   const effectiveDraft = touched ? draft : savedDraft;
 
   const saveMutation = useMutation({
-    mutationFn: () => api.updateConfig(activeName, draft),
+    mutationFn: () => {
+      // Store token in localStorage on save
+      if (apiToken && typeof window !== "undefined") {
+        localStorage.setItem("engine_api_token", apiToken);
+      }
+      return api.updateConfig(activeName, draft, apiToken || undefined);
+    },
     onSuccess: () => {
       toast.success(`Saved ${activeName}.yaml — engine will use new thresholds on next cycle.`);
       qc.invalidateQueries({ queryKey: ["configs"] });
@@ -106,6 +117,22 @@ export function ConfigPanel() {
 
             {/* Editor */}
             <div className="lg:col-span-3">
+              {/* API token input — required for saves since rev 5 */}
+              <div className="mb-3 flex items-center gap-2">
+                <Lock className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                <Input
+                  type="password"
+                  placeholder="ENGINE_API_TOKEN (required to save)"
+                  value={apiToken}
+                  onChange={(e) => setApiToken(e.target.value)}
+                  className="h-7 text-xs max-w-xs"
+                />
+                <span className="text-[10px] text-muted-foreground">
+                  {!apiToken && "⚠ Saves will 403 without a token"}
+                  {apiToken && "✓ Token set (stored in browser)"}
+                </span>
+              </div>
+
               <div className="flex items-center justify-between mb-2">
                 <div className="text-xs text-muted-foreground">
                   Editing: <code className="bg-muted px-1 rounded">{activeName}.yaml</code>
