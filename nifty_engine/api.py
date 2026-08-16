@@ -482,7 +482,9 @@ def update_config(name: str, body: ConfigUpdate, request: Request):
 
     SECURITY: If ENGINE_API_TOKEN is set in the environment, all write
     requests must include `Authorization: Bearer <token>` header.
-    If the token is not set, writes are allowed only from localhost.
+    If the token is not set, writes are blocked entirely — the old
+    localhost fallback was bypassable because Caddy always connects
+    from localhost (making request.client.host always 127.0.0.1).
     """
     from .config import CONFIG_DIR, reload
     import os
@@ -498,20 +500,16 @@ def update_config(name: str, body: ConfigUpdate, request: Request):
         if not secrets.compare_digest(provided, api_token):
             raise HTTPException(status_code=401, detail="Invalid API token")
     else:
-        # No token configured — restrict to localhost only
-        client_host = request.client.host if request.client else ""
-        forwarded = request.headers.get("X-Forwarded-For", "")
-        # Allow localhost / 127.0.0.1 / ::1
-        is_local = (
-            client_host in ("127.0.0.1", "::1", "localhost", "")
-            or forwarded.startswith("127.0.0.1")
-            or forwarded.startswith("::1")
+        # No token configured — block ALL writes.
+        # The old localhost check was bypassable: Caddy proxies on localhost,
+        # so request.client.host is always 127.0.0.1 regardless of who the
+        # original external caller was. There is no reliable way to distinguish
+        # "the Next.js rewrite called this" from "an attacker called this"
+        # without a token.
+        raise HTTPException(
+            status_code=403,
+            detail="Config writes are disabled. Set ENGINE_API_TOKEN in .env to enable authenticated writes.",
         )
-        if not is_local:
-            raise HTTPException(
-                status_code=403,
-                detail="Config writes are blocked from non-localhost. Set ENGINE_API_TOKEN to enable remote writes.",
-            )
 
     allowed = {"risk", "strategies", "costs", "trading_hours", "broker"}
     if name not in allowed:

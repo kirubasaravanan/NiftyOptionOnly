@@ -150,7 +150,8 @@ class DebitSpreadStrategy(StrategyBase):
                 f"net debit non-positive ({net_debit:.2f}) — short leg too expensive"
             )
 
-        qty = 75    # 1 lot
+        from ..utils.config_helpers import get_lot_size
+        qty = get_lot_size()
         max_loss = net_debit * qty
         max_gain = (test_width - net_debit) * qty
         if max_gain <= 0:

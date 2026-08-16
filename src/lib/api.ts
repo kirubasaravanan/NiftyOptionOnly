@@ -317,12 +317,17 @@ export const api = {
       body: JSON.stringify(req),
     }),
   configs: () => fetchJson<Record<string, string>>("/api/config"),
-  updateConfig: (name: string, content: string) =>
-    fetchJson<{ ok: boolean; name: string; size: number }>(`/api/config/${name}`, {
+  updateConfig: (name: string, content: string, token?: string) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    return fetchJson<{ ok: boolean; name: string; size: number }>(`/api/config/${name}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ name, content }),
-    }),
+    });
+  },
   alerts: (limit = 50) =>
     fetchJson<{ count: number; items: AlertItem[] }>(`/api/alerts?limit=${limit}`),
   sendTestAlert: () =>

@@ -299,6 +299,7 @@ class Engine:
                 short_leg=short_leg,
                 side="BUY",
                 lots=lots,
+                lot_size=get_lot_size(),  # from config, not hardcoded
                 strategy=chosen_eval.strategy.value,
                 stop_loss=stop,
                 take_profit=target,
