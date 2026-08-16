@@ -541,18 +541,57 @@ class Engine:
                             description="Thesis score has dropped from CONFIDENT to CAUTIOUS. Engine will tighten stops and watch for further deterioration.",
                         )
                     elif thesis.state == PositionState.REDUCE:
-                        self.notifier.send_alert(
-                            AlertType.POSITION_ADJUSTED,
-                            f"Position Reduce — {pos.strategy.value}",
-                            fields={
-                                "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
-                                "Lots": pos.lots,
-                                "Composite Score": f"{thesis.composite:.0f}/100",
-                                "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
-                                "Action": "REDUCE — cut exposure",
-                            },
-                            description="Thesis score has dropped into REDUCE zone. Engine is reducing position size to limit further loss if thesis continues to deteriorate.",
-                        )
+                        # REDUCE: actually cut exposure
+                        # 1 lot → can't partially close → full exit
+                        # 2+ lots → close half (round down), hold the rest
+                        if pos.lots <= 1:
+                            # Can't reduce 1 lot — must exit entirely
+                            self.notifier.send_alert(
+                                AlertType.POSITION_ADJUSTED,
+                                f"Position Exited (REDUCE, 1 lot) — {pos.strategy.value}",
+                                fields={
+                                    "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
+                                    "Lots": pos.lots,
+                                    "Composite Score": f"{thesis.composite:.0f}/100",
+                                    "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
+                                    "Action": "EXIT — 1 lot, can't partially close",
+                                },
+                                description="Thesis in REDUCE zone but position is 1 lot — can't cut half a lot, so exiting entirely to limit further loss.",
+                            )
+                            self._exit_position(pos, current_price, snapshot, now,
+                                                reason="REDUCE_1LOT",
+                                                thesis_score=thesis_score)
+                            continue  # skip further checks — position is closed
+                        else:
+                            # 2+ lots: close half (round down, minimum 1)
+                            lots_to_close = max(1, pos.lots // 2)
+                            partial_result = self.order_manager.partial_close(
+                                pos, lots_to_close, current_price,
+                            )
+                            # Record P&L for the closed portion
+                            closed_qty = lots_to_close * get_lot_size()
+                            partial_gross = (partial_result.fill_price - pos.entry_price) * closed_qty
+                            from .execution import CostModel
+                            partial_cost = CostModel().cost_for_round_trip(
+                                pos.entry_price, partial_result.fill_price, closed_qty,
+                            ).total
+                            partial_net = partial_gross - partial_cost
+                            self.risk.record_trade_result(partial_net, now)
+
+                            self.notifier.send_alert(
+                                AlertType.POSITION_ADJUSTED,
+                                f"Position Reduced — {pos.strategy.value} ({lots_to_close}/{pos.lots + lots_to_close} lots closed)",
+                                fields={
+                                    "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
+                                    "Closed": f"{lots_to_close} lots",
+                                    "Remaining": f"{pos.lots} lots",
+                                    "Partial P&L": f"₹{partial_net:+,.0f}",
+                                    "Composite Score": f"{thesis.composite:.0f}/100",
+                                    "Unrealised P&L": f"₹{pos.unrealised_pnl:,.0f}",
+                                    "Action": f"REDUCED — closed {lots_to_close} lot(s), holding {pos.lots}",
+                                },
+                                description=f"Thesis in REDUCE zone. Closed {lots_to_close} of {pos.lots + lots_to_close} lots at ₹{partial_result.fill_price:.2f}. Remaining {pos.lots} lots stay open with tighter monitoring.",
+                            )
                     elif thesis.state == PositionState.REVERSE:
                         # Direction flip detected — emit REVERSAL alert and exit
                         self.notifier.send_alert(

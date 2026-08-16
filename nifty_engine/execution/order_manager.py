@@ -85,17 +85,54 @@ class OrderManager:
         )
 
     def close_position(self, position: Position, exit_price: Optional[float] = None) -> OrderResult:
-        """Close an existing paper position."""
+        """Close an existing paper position (full close)."""
         price = exit_price or position.current_price or position.entry_price
-        # Apply slippage on exit too (1 point per leg default)
+        # Apply slippage on exit too (1 point against us)
         slipped = max(0.0, price - 1.0)
         position.current_price = slipped
         position.status = "EXITED"
+        lot_size = self._lot_size_for_position(position)
         return OrderResult(
             success=True,
             order_id=f"PAPER-EXIT-{uuid.uuid4().hex[:12]}",
             fill_price=slipped,
-            filled_quantity=position.lots * req.lot_size,
+            filled_quantity=position.lots * lot_size,
+            slippage_applied=1.0,
+        )
+
+    def partial_close(self, position: Position, lots_to_close: int, exit_price: Optional[float] = None) -> OrderResult:
+        """Partially close a position — reduce lots but keep position OPEN.
+
+        Used by the REDUCE thesis state:
+          - If position has 2+ lots and thesis enters REDUCE, close half (round down)
+          - If position has 1 lot, REDUCE should call close_position() instead
+
+        Returns OrderResult for the closed portion. The remaining lots stay
+        in the original Position object with updated state.
+        """
+        if lots_to_close >= position.lots:
+            # Can't partially close more than we have — full close instead
+            return self.close_position(position, exit_price)
+
+        price = exit_price or position.current_price or position.entry_price
+        slipped = max(0.0, price - 1.0)
+        lot_size = self._lot_size_for_position(position)
+
+        # Record the closed portion's P&L for journaling
+        closed_qty = lots_to_close * lot_size
+        # The position keeps tracking the remaining lots
+        original_lots = position.lots
+        position.lots = original_lots - lots_to_close
+
+        # Adjust unrealised P&L to reflect remaining position size
+        if position.unrealised_pnl != 0 and original_lots > 0:
+            position.unrealised_pnl = position.unrealised_pnl * (position.lots / original_lots)
+
+        return OrderResult(
+            success=True,
+            order_id=f"PAPER-PARTIAL-{uuid.uuid4().hex[:12]}",
+            fill_price=slipped,
+            filled_quantity=closed_qty,
             slippage_applied=1.0,
         )
 
