@@ -33,7 +33,7 @@ load_dotenv()
 
 from .engine import Engine
 from .models import RunMode
-from .backtest import BacktestEngine, BacktestConfig
+from .backtest import BacktestEngine, BacktestConfig, AblationTester
 from .journal import DecisionLogger, TradeLogger, PerformanceAnalytics
 from .utils.time_utils import ist_now, is_market_open
 
@@ -56,6 +56,76 @@ RUNS_DIR = os.environ.get("ENGINE_RUNS_DIR", "/home/z/my-project/runs")
 CAPITAL = float(os.environ.get("ENGINE_CAPITAL", "1000000"))
 
 
+# Singleton broker — instantiating DhanBroker is expensive (creates DhanContext,
+# fetches security list). Reuse one instance across all requests.
+_broker_singleton = None
+
+# Cached snapshot (5s TTL) — building a snapshot involves 4 broker API calls
+# (NIFTY, VIX, BankNifty, NIFTY futures), each ~1-2s. Cache prevents the API
+# server from being overwhelmed by polling.
+_cached_snapshot = None
+_cached_snapshot_ts = 0.0
+
+# Cached decision (30s TTL) — running Engine() creates a new DhanBroker which
+# is expensive (loads security list CSV = 50MB).
+_cached_decision = None
+_cached_decision_ts = 0.0
+
+SNAPSHOT_TTL_SECONDS = 30.0
+DECISION_TTL_SECONDS = 30.0
+
+
+def get_broker():
+    global _broker_singleton
+    if _broker_singleton is None:
+        from .data import DhanBroker
+        _broker_singleton = DhanBroker()
+    return _broker_singleton
+
+
+def get_cached_snapshot():
+    """Get a cached snapshot (refresh every 30s) to keep the API responsive.
+
+    Each refresh makes 4 broker API calls (NIFTY, VIX, BankNifty, NIFTY futures).
+    These are network-bound and ~1-2s each, so cache aggressively.
+    """
+    import time
+    global _cached_snapshot, _cached_snapshot_ts
+    now = time.time()
+    if _cached_snapshot is None or (now - _cached_snapshot_ts) > SNAPSHOT_TTL_SECONDS:
+        try:
+            b = get_broker()
+            _cached_snapshot = b.get_snapshot()
+            _cached_snapshot_ts = now
+        except Exception as e:
+            # If broker fails, keep the old snapshot (or None)
+            print(f"[snapshot refresh error] {type(e).__name__}: {e}", flush=True)
+    return _cached_snapshot
+
+
+def get_cached_decision():
+    """Get a cached decision (refresh every 30s).
+
+    Engine.run_cycle() creates a new DhanBroker each call which loads the 50MB
+    security list CSV — cache to avoid memory thrash.
+    """
+    import time
+    global _cached_decision, _cached_decision_ts
+    now = time.time()
+    if _cached_decision is None or (now - _cached_decision_ts) > DECISION_TTL_SECONDS:
+        try:
+            # Pass the singleton broker so Engine doesn't create its own
+            engine = Engine(
+                mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR,
+                broker=get_broker(),
+            )
+            _cached_decision = engine.run_cycle()
+            _cached_decision_ts = now
+        except Exception as e:
+            print(f"[decision refresh error] {type(e).__name__}: {e}", flush=True)
+    return _cached_decision
+
+
 # ---------- models for API payloads ----------
 
 class BacktestRequest(BaseModel):
@@ -63,6 +133,12 @@ class BacktestRequest(BaseModel):
     end_date: str
     capital: float = 1_000_000.0
     interval: str = "day"
+
+
+class AblationRequest(BaseModel):
+    start_date: str
+    end_date: str
+    capital: float = 1_000_000.0
 
 
 class ConfigUpdate(BaseModel):
@@ -75,8 +151,7 @@ class ConfigUpdate(BaseModel):
 @app.get("/api/health")
 def health():
     """Quick liveness check — also reports broker & market state."""
-    from .data import DhanBroker
-    b = DhanBroker()
+    b = get_broker()
     return {
         "ok": True,
         "broker_connected": b.is_connected(),
@@ -88,18 +163,73 @@ def health():
 
 @app.get("/api/snapshot")
 def snapshot():
-    """Return the current market snapshot."""
-    from .data import DhanBroker
-    b = DhanBroker()
-    snap = b.get_snapshot()
-    return _serialize_snapshot(snap)
+    """Return the current market snapshot + cross-market confirmation."""
+    from .features.correlation import (
+        VIXValuationCalculator, OIClassifier, FuturesBasisCalculator,
+        BankNiftyCalculator,
+    )
+    snap = get_cached_snapshot()
+
+    # Compute confirmation features for display — even on holidays we can
+    # show VIX valuation + Bank Nifty + futures basis (these don't require
+    # the option chain which is unavailable when market is closed).
+    confirmation_data = None
+    try:
+        bn = getattr(snap, "_banknifty_quote", None)
+        nf = getattr(snap, "_nifty_futures_quote", None)
+        vix_val = VIXValuationCalculator.compute(snap)
+        oi_cls = OIClassifier.classify(snap) if snap.option_chain else None
+        fb = FuturesBasisCalculator.compute(snap, nf)
+        bnc = BankNiftyCalculator.compute(snap, bn)
+        confirmation_data = {
+            "vix_valuation": {
+                "vix": vix_val.vix,
+                "vix_percentile": vix_val.vix_percentile,
+                "vix_change": vix_val.vix_change,
+                "iv_vix_gap": vix_val.iv_vix_gap,
+                "valuation": vix_val.valuation,
+                "reasons": vix_val.reasons,
+            },
+            "oi_classification": {
+                "ce": oi_cls.ce_classification if oi_cls else "UNKNOWN",
+                "pe": oi_cls.pe_classification if oi_cls else "UNKNOWN",
+                "call_wall": oi_cls.call_wall if oi_cls else None,
+                "put_wall": oi_cls.put_wall if oi_cls else None,
+                "max_pain": oi_cls.max_pain if oi_cls else None,
+                "reasons": oi_cls.reasons if oi_cls else ["option chain unavailable (market closed)"],
+            },
+            "futures_basis": {
+                "spot": fb.spot,
+                "futures": fb.futures,
+                "basis": fb.basis,
+                "basis_pct": fb.basis_pct,
+                "interpretation": fb.interpretation,
+                "reasons": fb.reasons,
+            },
+            "banknifty_confirmation": {
+                "nifty_change_pct": bnc.nifty_change_pct,
+                "banknifty_change_pct": bnc.banknifty_change_pct,
+                "correlation_state": bnc.correlation_state,
+                "reasons": bnc.reasons,
+            },
+        }
+    except Exception as e:
+        confirmation_data = {"error": str(e)}
+
+    # Also include auxiliary market data
+    aux = {
+        "banknifty": getattr(snap, "_banknifty_quote", None),
+        "nifty_futures": getattr(snap, "_nifty_futures_quote", None),
+    }
+    return {**_serialize_snapshot(snap), "confirmation": confirmation_data, "aux": aux}
 
 
 @app.get("/api/decision")
 def decision():
-    """Run one decision cycle and return the Decision."""
-    engine = Engine(mode=RunMode.PAPER, capital=CAPITAL, runs_dir=RUNS_DIR)
-    d = engine.run_cycle()
+    """Run one decision cycle and return the Decision (cached 30s)."""
+    d = get_cached_decision()
+    if d is None:
+        return {"error": "decision engine unavailable", "action": "NO_TRADE"}
     return _serialize_decision(d)
 
 
@@ -190,6 +320,55 @@ def backtest_run(req: BacktestRequest):
     eng = BacktestEngine(cfg)
     result = eng.run()
     return _serialize_backtest_result(result)
+
+
+@app.post("/api/ablation/run")
+def ablation_run(req: AblationRequest):
+    """Run an ablation test — tests incremental value of each Layer 3 feature.
+
+    Returns baseline metrics + per-feature deltas. Per spec: only features
+    that improve OOS expectancy should be kept in the live engine.
+    """
+    try:
+        start = datetime.strptime(req.start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(req.end_date, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid date: {e}")
+    tester = AblationTester(
+        start_date=start, end_date=end, capital=req.capital,
+    )
+    result = tester.run()
+    return {
+        "baseline": {
+            "feature_name": result.baseline.feature_name,
+            "description": result.baseline.description,
+            "oos_return_pct": result.baseline.oos_return_pct,
+            "oos_expectancy": result.baseline.oos_expectancy,
+            "oos_win_rate": result.baseline.oos_win_rate,
+            "oos_trades": result.baseline.oos_trades,
+            "oos_max_dd_pct": result.baseline.oos_max_dd_pct,
+            "oos_sharpe": result.baseline.oos_sharpe,
+        },
+        "variants": [
+            {
+                "feature_name": v.feature_name,
+                "description": v.description,
+                "oos_return_pct": v.oos_return_pct,
+                "oos_expectancy": v.oos_expectancy,
+                "oos_win_rate": v.oos_win_rate,
+                "oos_trades": v.oos_trades,
+                "oos_max_dd_pct": v.oos_max_dd_pct,
+                "oos_sharpe": v.oos_sharpe,
+                "incremental_expectancy": v.incremental_expectancy,
+                "incremental_return": v.incremental_return,
+                "keeps_feature": v.keeps_feature,
+                "error": v.error,
+            }
+            for v in result.variants
+        ],
+        "summary": result.summary,
+        "recommendation": result.recommendation,
+    }
 
 
 @app.get("/api/config")
@@ -387,7 +566,14 @@ def main():
     """Run the FastAPI server."""
     import uvicorn
     port = int(os.environ.get("ENGINE_API_PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        app, host="0.0.0.0", port=port, log_level="info",
+        timeout_keep_alive=300,
+        timeout_graceful_shutdown=30,
+        workers=1,
+        access_log=False,
+        limit_concurrency=5,
+    )
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ from ..execution import CostModel
 from ..features.technical import TechnicalCalculator, attach_features_to_index
 from ..features.market_regime import RegimeEngine
 from ..features.volatility import VolatilityCalculator
+from ..features.correlation import compute_all_confirmations
 from ..models import (
     Decision, DecisionAction, IndexQuote, IndiaVIX, MarketSnapshot,
     OptionQuote, OptionType, Position, RunMode, StrategyName,
@@ -187,8 +188,14 @@ class BacktestEngine:
             # Assess regime
             regime_assessment = self.regime.assess(snapshot)
 
-            # Select strategy
-            chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment)
+            # Compute cross-market confirmation (Layer 3 + 4)
+            # Uses the synthesised option chain + Bank Nifty + futures + VIX
+            confirmation = self._compute_confirmation(snapshot, regime_assessment)
+
+            # Select strategy (with confirmation score modulating confidence)
+            chosen_eval, all_evals = self.selector.select(
+                snapshot, regime_assessment, confirmation,
+            )
 
             # Option selection
             opt_sel = self.option_selector.select(snapshot, chosen_eval)
@@ -242,6 +249,52 @@ class BacktestEngine:
         return self._build_result()
 
     # ---- snapshot building from historical bars ----
+    def _compute_confirmation(self, snapshot: MarketSnapshot, regime):
+        """Compute cross-market confirmation using historical Bank Nifty / futures
+        proxies. In backtest we don't fetch real Bank Nifty history (would slow
+        it down) — we use a synthesised proxy derived from NIFTY + small noise.
+
+        For ablation testing this is sufficient to detect when confirmation
+        features help or hurt. For final validation, run on LIVE paper data.
+        """
+        if not snapshot.data_valid:
+            return None
+        if regime.market_regime.value in ("STRONG_BULL", "BULL", "WEAK_BULL", "BREAKOUT"):
+            direction = "BULLISH"
+        elif regime.market_regime.value in ("STRONG_BEAR", "BEAR", "WEAK_BEAR"):
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
+        # Synthesise Bank Nifty from NIFTY with realistic (imperfect) correlation.
+        # Bank Nifty ~ 2.35x NIFTY level. % change correlated with NIFTY but with
+        # noise so confirmation sometimes diverges.
+        import random
+        seed = int(snapshot.timestamp.timestamp()) if hasattr(snapshot.timestamp, "timestamp") else 0
+        rng = random.Random(seed)
+        nifty_prev = snapshot.index.prev_close or snapshot.index.ltp
+        nifty_change_pct = ((snapshot.index.ltp - nifty_prev) / nifty_prev * 100) if nifty_prev > 0 else 0.0
+        # 85% of the time Bank Nifty follows NIFTY; 15% it diverges
+        if rng.random() < 0.85:
+            bn_change_pct = nifty_change_pct * (0.7 + 0.6 * rng.random())
+        else:
+            bn_change_pct = -nifty_change_pct * (0.4 + 0.6 * rng.random())
+        bn_ltp = snapshot.index.ltp * 2.35
+        bn_prev = bn_ltp / (1 + bn_change_pct / 100)
+        banknifty_q = {"ltp": bn_ltp, "prev_close": bn_prev}
+        # NIFTY futures — small premium, occasionally moves to discount
+        basis_bps = rng.gauss(8, 5)  # ~+8bps premium, std 5
+        fut_price = snapshot.index.ltp * (1 + basis_bps / 10000)
+        fut_prev = fut_price * (1 - nifty_change_pct / 100 / 1.0)
+        futures_q = {"ltp": fut_price, "prev_close": fut_prev}
+        try:
+            return compute_all_confirmations(
+                snapshot, banknifty_quote=banknifty_q, futures_quote=futures_q,
+                direction=direction,
+            )
+        except Exception:
+            return None
+
+    # ---- snapshot building from historical bars ----
     def _build_snapshot(self, window: pd.DataFrame, bar, ts) -> Optional[MarketSnapshot]:
         try:
             idx_quote = IndexQuote(
@@ -264,10 +317,21 @@ class BacktestEngine:
             # data is unavailable from DhanHQ API).
             chain = self._synthesize_option_chain(idx_quote, ts)
 
+            # Synthesize India VIX from ATR (higher ATR% -> higher VIX).
+            # This is a reasonable proxy: VIX tracks realised vol, which ATR measures.
+            atr_pct = (idx_quote.atr or (idx_quote.ltp * 0.005)) / idx_quote.ltp
+            vix_value = max(8.0, min(35.0, atr_pct * 100 * 16))  # scale ATR% to VIX range
+            vix = IndiaVIX(
+                ltp=vix_value,
+                prev_close=vix_value * 1.02,
+                iv_percentile=50.0,
+                last_updated=ts,
+            )
+
             snapshot = MarketSnapshot(
                 timestamp=ts,
                 index=idx_quote,
-                india_vix=None,
+                india_vix=vix,
                 option_chain=chain,
                 market_open=True,
                 data_valid=True,
@@ -284,9 +348,19 @@ class BacktestEngine:
         historical underlying data. The IV assumption (15%) is conservative;
         once real historical option data is wired in, this method is removed.
         """
+        import random
         spot = idx.ltp
         if spot <= 0:
             return []
+        atr = idx.atr or (spot * 0.005)
+        # Use a deterministic seed based on ts so backtests are reproducible
+        seed_base = int(ts.timestamp()) if hasattr(ts, "timestamp") else 0
+        rng = random.Random(seed_base)
+
+        # Direction of OI buildup — biased toward current trend
+        prev_close = idx.prev_close or spot
+        is_up = spot >= prev_close
+
         atm = int(round(spot / 50.0) * 50)
         iv = 0.15  # 15% default IV — replaceable with historical IV when available
         r = 0.07   # risk-free rate
@@ -298,6 +372,16 @@ class BacktestEngine:
             for ot in (OptionType.CE, OptionType.PE):
                 price = bs_option_price(spot, k, t, iv, r, ot)
                 greeks = bs_greeks(spot, k, t, iv, r, ot)
+                # Volume + OI vary with moneyness — ATM options have highest liquidity
+                moneyness = abs(k - spot) / spot
+                liquidity = max(0.1, 1.0 - moneyness * 8)
+                base_vol = int(10_000 * liquidity * (0.7 + 0.6 * rng.random()))
+                base_oi = int(50_000 * liquidity * (0.7 + 0.6 * rng.random()))
+                # OI change: long buildup if price up, short buildup if price down
+                if is_up:
+                    oi_change = int(base_oi * 0.05 * (0.5 + rng.random())) if ot == OptionType.CE else -int(base_oi * 0.03 * rng.random())
+                else:
+                    oi_change = int(base_oi * 0.05 * (0.5 + rng.random())) if ot == OptionType.PE else -int(base_oi * 0.03 * rng.random())
                 chain.append(OptionQuote(
                     symbol=f"NIFTY{ts.date().strftime('%y%b').upper()}{k}{ot.value}",
                     exchange="NSE",
@@ -307,8 +391,9 @@ class BacktestEngine:
                     ltp=max(0.05, price),
                     bid=max(0.05, price - 1.0),
                     ask=price + 1.0,
-                    volume=10_000,
-                    oi=50_000,
+                    volume=base_vol,
+                    oi=base_oi,
+                    oi_change=oi_change,
                     iv=iv,
                     delta=greeks["delta"],
                     gamma=greeks["gamma"],

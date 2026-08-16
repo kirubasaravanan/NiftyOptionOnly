@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Activity, TrendingUp, TrendingDown, Pause, AlertTriangle, Wifi, WifiOff } from "lucide-react";
+import { ConfirmationPanel } from "./ConfirmationPanel";
 import { useEffect, useState } from "react";
 
 export function LiveDashboard() {
@@ -19,25 +20,25 @@ export function LiveDashboard() {
   const { data: snapshot } = useQuery({
     queryKey: ["snapshot"],
     queryFn: api.snapshot,
-    refetchInterval: 10000,
+    refetchInterval: 30000,  // 30s — server caches for 30s, so this matches
   });
 
   const { data: decision } = useQuery({
     queryKey: ["decision"],
     queryFn: api.decision,
-    refetchInterval: 15000,
+    refetchInterval: 30000,  // 30s — decision is expensive
   });
 
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: api.status,
-    refetchInterval: 15000,
+    refetchInterval: 30000,
   });
 
   const { data: performance } = useQuery({
     queryKey: ["performance"],
     queryFn: api.performance,
-    refetchInterval: 30000,
+    refetchInterval: 60000,  // 1 min — performance is computed from journal
   });
 
   const spotChange = snapshot?.index.ltp && snapshot?.index.prev_close
@@ -273,6 +274,9 @@ export function LiveDashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Cross-market confirmation panel */}
+      <ConfirmationPanel />
 
       {/* Open positions + Performance summary */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

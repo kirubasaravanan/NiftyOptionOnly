@@ -77,6 +77,8 @@ export interface Snapshot {
     volume: number;
     oi: number;
   }>;
+  confirmation: ConfirmationData | null;
+  aux: AuxMarketData;
 }
 
 export interface Decision {
@@ -197,6 +199,67 @@ export interface BacktestResult {
   error: string | null;
 }
 
+export interface AblationVariant {
+  feature_name: string;
+  description: string;
+  oos_return_pct: number;
+  oos_expectancy: number;
+  oos_win_rate: number;
+  oos_trades: number;
+  oos_max_dd_pct: number;
+  oos_sharpe: number;
+  incremental_expectancy: number;
+  incremental_return: number;
+  keeps_feature: boolean;
+  error: string | null;
+}
+
+export interface AblationResult {
+  baseline: AblationVariant;
+  variants: AblationVariant[];
+  summary: string;
+  recommendation: string[];
+}
+
+export interface ConfirmationData {
+  vix_valuation: {
+    vix: number | null;
+    vix_percentile: number | null;
+    vix_change: number | null;
+    iv_vix_gap: number | null;
+    valuation: string;
+    reasons: string[];
+  };
+  oi_classification: {
+    ce: string;
+    pe: string;
+    call_wall: number | null;
+    put_wall: number | null;
+    max_pain: number | null;
+    reasons: string[];
+  };
+  futures_basis: {
+    spot: number;
+    futures: number | null;
+    basis: number | null;
+    basis_pct: number | null;
+    interpretation: string;
+    reasons: string[];
+  };
+  banknifty_confirmation: {
+    nifty_change_pct: number;
+    banknifty_change_pct: number | null;
+    correlation_state: string;
+    reasons: string[];
+  };
+  error?: string;
+}
+
+export interface AuxMarketData {
+  banknifty: { ltp: number; prev_close: number | null; open?: number; high?: number; low?: number } | null;
+  nifty_futures: { ltp: number; prev_close: number | null; open?: number; high?: number; low?: number } | null;
+}
+
 export interface HealthStatus {
   ok: boolean;
   broker_connected: boolean;
@@ -234,6 +297,12 @@ export const api = {
   performance: () => fetchJson<PerformanceReport>("/api/performance"),
   backtest: (req: { start_date: string; end_date: string; capital: number; interval: string }) =>
     fetchJson<BacktestResult>("/api/backtest/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    }),
+  ablation: (req: { start_date: string; end_date: string; capital: number }) =>
+    fetchJson<AblationResult>("/api/ablation/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),

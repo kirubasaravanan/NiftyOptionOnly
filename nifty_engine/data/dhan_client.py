@@ -37,6 +37,16 @@ NIFTY_INDEX_SECURITY_ID = "13"
 NIFTY_INDEX_EXCHANGE = "IDX_I"
 NIFTY_INDEX_INSTRUMENT_TYPE = "INDEX"
 
+# Bank Nifty — used as confirmation factor (security_id 25)
+BANKNIFTY_INDEX_SECURITY_ID = "25"
+# India VIX — used for IV valuation (security_id 21)
+INDIA_VIX_SECURITY_ID = "21"
+# NIFTY current-month futures (Aug 2026 contract — security_id 58072)
+# NOTE: this must be updated monthly when futures roll over
+NIFTY_FUT_SECURITY_ID = "58072"
+NIFTY_FUT_EXCHANGE = "NSE_FNO"
+NIFTY_FUT_INSTRUMENT_TYPE = "FUTIDX"
+
 
 class DhanBroker(BrokerInterface):
     """DhanHQ implementation of BrokerInterface (dhanhq 2.x API)."""
@@ -161,27 +171,98 @@ class DhanBroker(BrokerInterface):
         )
 
     def get_india_vix(self) -> Optional[IndiaVIX]:
-        """India VIX — on Dhan, security_id '13' is NIFTY 50; VIX is on a different ID.
-        We attempt to fetch it but tolerate failures (vol regime works from IVs)."""
+        """India VIX — fetched from DhanHQ historical API (security_id '15').
+        Works even on holidays because it returns the most recent trading day."""
         if not self.is_connected():
             return None
         try:
-            # India VIX has Dhan security_id '15' (best-effort — may need lookup)
+            from datetime import timedelta
+            end = ist_now().date()
+            start = end - timedelta(days=14)
             resp = self._hd.historical_daily_data(
-                "15", "IDX_I", "INDEX",
-                ist_now().date().isoformat(),
-                ist_now().date().isoformat(),
+                INDIA_VIX_SECURITY_ID, "IDX_I", "INDEX",
+                start.isoformat(), end.isoformat(),
             )
             data = resp.get("data") if isinstance(resp, dict) else None
-            if data and data.get("close"):
-                return IndiaVIX(
-                    ltp=float(data["close"][-1]),
-                    prev_close=float(data["close"][-2]) if len(data["close"]) > 1 else None,
-                    last_updated=ist_now(),
-                )
+            if not data or not data.get("close"):
+                return None
+            closes = data["close"]
+            if not closes:
+                return None
+            ltp = float(closes[-1])
+            prev_close = float(closes[-2]) if len(closes) > 1 else None
+            # VIX percentile: rank of current vs last 60 closes
+            vix_pct = None
+            if len(closes) >= 10:
+                sorted_v = sorted(closes)
+                rank = sum(1 for x in sorted_v if x <= ltp)
+                vix_pct = 100.0 * rank / len(sorted_v)
+            return IndiaVIX(
+                ltp=ltp,
+                prev_close=prev_close,
+                iv_percentile=vix_pct,
+                last_updated=ist_now(),
+            )
         except Exception:
             return None
-        return None
+
+    def get_banknifty_quote(self) -> Optional[dict]:
+        """Fetch Bank Nifty recent daily quote. Returns dict with ltp + prev_close.
+        Works on holidays (returns last trading day's close)."""
+        if not self.is_connected():
+            return None
+        try:
+            from datetime import timedelta
+            end = ist_now().date()
+            start = end - timedelta(days=14)
+            resp = self._hd.historical_daily_data(
+                BANKNIFTY_INDEX_SECURITY_ID, "IDX_I", "INDEX",
+                start.isoformat(), end.isoformat(),
+            )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not data or not data.get("close"):
+                return None
+            closes = data["close"]
+            if not closes:
+                return None
+            return {
+                "ltp": float(closes[-1]),
+                "prev_close": float(closes[-2]) if len(closes) > 1 else None,
+                "open": float(data["open"][-1]),
+                "high": float(data["high"][-1]),
+                "low": float(data["low"][-1]),
+            }
+        except Exception:
+            return None
+
+    def get_nifty_futures_quote(self) -> Optional[dict]:
+        """Fetch NIFTY futures quote (current month contract). Returns dict with ltp + prev_close.
+        Works on holidays (returns last trading day's close)."""
+        if not self.is_connected():
+            return None
+        try:
+            from datetime import timedelta
+            end = ist_now().date()
+            start = end - timedelta(days=14)
+            resp = self._hd.historical_daily_data(
+                NIFTY_FUT_SECURITY_ID, NIFTY_FUT_EXCHANGE, NIFTY_FUT_INSTRUMENT_TYPE,
+                start.isoformat(), end.isoformat(),
+            )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not data or not data.get("close"):
+                return None
+            closes = data["close"]
+            if not closes:
+                return None
+            return {
+                "ltp": float(closes[-1]),
+                "prev_close": float(closes[-2]) if len(closes) > 1 else None,
+                "open": float(data["open"][-1]),
+                "high": float(data["high"][-1]),
+                "low": float(data["low"][-1]),
+            }
+        except Exception:
+            return None
 
     def get_option_chain(
         self,
@@ -256,19 +337,30 @@ class DhanBroker(BrokerInterface):
 
         if not self.is_market_open():
             # On holiday we can still fetch the most recent daily candle
-            # for index but option chain is unavailable.
+            # for index but option chain is unavailable. We DO fetch VIX,
+            # Bank Nifty and futures so the dashboard has something to display.
             try:
                 index = self._fallback_recent_index_quote()
-                return MarketSnapshot(
+                vix = self.get_india_vix()
+                bn = self.get_banknifty_quote()
+                nf = self.get_nifty_futures_quote()
+                # Stash the auxiliary data on the snapshot so callers can read it
+                # (the snapshot model doesn't have a dedicated field for these,
+                # but we attach them via _aux for the API serializer)
+                snap = MarketSnapshot(
                     timestamp=now,
                     index=index,
-                    india_vix=None,
+                    india_vix=vix,
                     option_chain=[],
                     market_open=False,
                     data_valid=False,
                     data_invalid_reason="market closed (holiday / outside trading hours)",
                     time_bucket=current_time_bucket(),
                 )
+                # Attach auxiliary market data via private attributes
+                snap._banknifty_quote = bn
+                snap._nifty_futures_quote = nf
+                return snap
             except NoDataError as exc:
                 return MarketSnapshot(
                     timestamp=now,
@@ -293,13 +385,15 @@ class DhanBroker(BrokerInterface):
             )
 
         vix = self.get_india_vix()
+        bn = self.get_banknifty_quote()
+        nf = self.get_nifty_futures_quote()
 
         try:
             chain = self.get_option_chain(
                 underlying=underlying, n_strikes_each_side=n_strikes_each_side,
             )
         except NoDataError as exc:
-            return MarketSnapshot(
+            snap = MarketSnapshot(
                 timestamp=now,
                 index=index,
                 india_vix=vix,
@@ -308,9 +402,13 @@ class DhanBroker(BrokerInterface):
                 data_invalid_reason=f"option chain: {exc}",
                 time_bucket=current_time_bucket(),
             )
+            snap._banknifty_quote = bn
+            snap._nifty_futures_quote = nf
+            return snap
 
+        # ---- final validity check ----
         if index.ltp <= 0 or not chain:
-            return MarketSnapshot(
+            snap = MarketSnapshot(
                 timestamp=now,
                 index=index,
                 india_vix=vix,
@@ -319,8 +417,11 @@ class DhanBroker(BrokerInterface):
                 data_invalid_reason="index LTP zero or chain empty",
                 time_bucket=current_time_bucket(),
             )
+            snap._banknifty_quote = bn
+            snap._nifty_futures_quote = nf
+            return snap
 
-        return MarketSnapshot(
+        snap = MarketSnapshot(
             timestamp=now,
             index=index,
             india_vix=vix,
@@ -330,6 +431,9 @@ class DhanBroker(BrokerInterface):
             data_invalid_reason=None,
             time_bucket=current_time_bucket(),
         )
+        snap._banknifty_quote = bn
+        snap._nifty_futures_quote = nf
+        return snap
 
     # ---- historical (Phase 6) ----
     def historical_candles(

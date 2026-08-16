@@ -18,6 +18,11 @@ from .decision import (
     RiskEngine, StrategySelector,
 )
 from .execution import OrderManager, OrderRequest, Reconciler
+from .features.correlation import (
+    VIXValuationCalculator, OIClassifier, FuturesBasisCalculator,
+    BankNiftyCalculator, CorrelationRegimeDetector,
+    ConfirmationScoreCalculator, compute_all_confirmations,
+)
 from .journal import DecisionLogger, TradeLogger
 from .models import (
     Decision, DecisionAction, MarketSnapshot, RunMode, StrategyName,
@@ -33,13 +38,16 @@ class Engine:
         mode: RunMode = RunMode.PAPER,
         capital: Optional[float] = None,
         runs_dir: str = "/home/z/my-project/runs",
+        broker: Optional[DhanBroker] = None,
     ) -> None:
         self.mode = mode
         cap_env = os.environ.get("ENGINE_CAPITAL")
         self.capital = float(capital if capital is not None else (cap_env or 1_000_000))
 
         # --- wiring ---
-        self.broker = DhanBroker()
+        # Reuse the passed-in broker if provided (avoids creating a new DhanContext
+        # which loads the 50MB security list CSV).
+        self.broker = broker if broker is not None else DhanBroker()
         self.cache = MarketCache(ttl_seconds=5.0)
         self.regime = RegimeEngineRunner()
         self.selector = StrategySelector()
@@ -69,7 +77,7 @@ class Engine:
             decision = self._no_trade_decision(
                 snapshot, now,
                 reason=f"reconciliation failed: {reconcile.reason}",
-                emergency=reconcile.emergency_action,
+                emergency=reconciler.emergency_action if False else reconcile.emergency_action,
             )
             self.decision_logger.log_decision(decision, self._snapshot_summary(snapshot))
             return decision
@@ -87,8 +95,12 @@ class Engine:
         # ---- 4. assess regime ----
         regime_assessment = self.regime.assess(snapshot)
 
+        # ---- 4b. compute cross-market confirmation (Layer 3 + 4) ----
+        # Correlation itself is NEVER a buy signal — it modulates confidence.
+        confirmation = self._compute_confirmation(snapshot, regime_assessment)
+
         # ---- 5. select strategy ----
-        chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment)
+        chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment, confirmation)
 
         # ---- 6. option selection ----
         opt_sel = self.option_selector.select(snapshot, chosen_eval)
@@ -180,12 +192,40 @@ class Engine:
             reasons=reasons,
             explainability_block=self._explainability(
                 snapshot, regime_assessment, chosen_eval, opt_sel, risk_decision, action, lots,
+                confirmation,
             ),
         )
 
         # ---- 10. journal ----
         self.decision_logger.log_decision(decision, self._snapshot_summary(snapshot))
         return decision
+
+    def _compute_confirmation(self, snapshot: MarketSnapshot, regime):
+        """Compute cross-market confirmation score.
+
+        Returns None if data is invalid — engine treats that as 'no info'.
+        """
+        if not snapshot.data_valid:
+            return None
+        # Direction from regime
+        if regime.market_regime.value in ("STRONG_BULL", "BULL", "WEAK_BULL", "BREAKOUT"):
+            direction = "BULLISH"
+        elif regime.market_regime.value in ("STRONG_BEAR", "BEAR", "WEAK_BEAR"):
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
+
+        banknifty_q = getattr(snapshot, "_banknifty_quote", None)
+        futures_q = getattr(snapshot, "_nifty_futures_quote", None)
+        try:
+            return compute_all_confirmations(
+                snapshot,
+                banknifty_quote=banknifty_q,
+                futures_quote=futures_q,
+                direction=direction,
+            )
+        except Exception:
+            return None
 
     # ---- helpers ----
     def _maybe_reset_day(self, now: datetime) -> None:
@@ -236,6 +276,7 @@ class Engine:
     @staticmethod
     def _explainability(
         snapshot, regime, evaluation, opt_sel, risk_decision, action, lots,
+        confirmation=None,
     ) -> str:
         lines = [
             "========== DECISION EXPLAINABILITY ==========",
@@ -244,15 +285,38 @@ class Engine:
             f"REGIME        : {regime.market_regime.value}",
             f"VOLATILITY    : {regime.volatility_regime.value}",
             f"REGIME CONFID : {regime.confidence:.2f}",
-            "",
-            f"STRATEGY       : {evaluation.strategy.value if evaluation else 'NO_TRADE'}",
-            f"ELIGIBLE       : {evaluation.eligible if evaluation else False}",
-            f"EXPECTED NET   : {evaluation.expected_net_value:.0f} INR" if evaluation else "EXPECTED NET   : 0",
-            f"CONFIDENCE     : {evaluation.confidence_score:.2f}" if evaluation else "CONFIDENCE     : 0",
-            f"RISK/REWARD    : {evaluation.risk_reward:.2f}" if evaluation else "RISK/REWARD    : 0",
-            "",
-            "REASONS:",
         ]
+        if confirmation is not None:
+            lines.append("")
+            lines.append("----- CROSS-MARKET CONFIRMATION -----")
+            lines.append(f"SCORE         : {confirmation.score:+.2f}  (range -1 to +1)")
+            lines.append(f"VIX           : {confirmation.vix_valuation.vix:.2f} ({confirmation.vix_valuation.valuation})")
+            if confirmation.vix_valuation.iv_vix_gap is not None:
+                lines.append(f"IV-VIX GAP    : {confirmation.vix_valuation.iv_vix_gap*100:+.2f}%")
+            lines.append(f"CE OI CLASS   : {confirmation.oi_classification.ce_classification}")
+            lines.append(f"PE OI CLASS   : {confirmation.oi_classification.pe_classification}")
+            if confirmation.oi_classification.call_wall:
+                lines.append(f"CALL WALL     : {confirmation.oi_classification.call_wall} (resistance)")
+            if confirmation.oi_classification.put_wall:
+                lines.append(f"PUT WALL     : {confirmation.oi_classification.put_wall} (support)")
+            lines.append(f"FUTURES BASIS : {confirmation.futures_basis.interpretation}")
+            if confirmation.futures_basis.basis_pct is not None:
+                lines.append(f"  basis%      : {confirmation.futures_basis.basis_pct:+.3f}%")
+            lines.append(f"BANK NIFTY    : {confirmation.banknifty_confirmation.correlation_state}")
+            if confirmation.banknifty_confirmation.banknifty_change_pct is not None:
+                lines.append(f"  BN change%  : {confirmation.banknifty_confirmation.banknifty_change_pct:+.2f}%")
+            lines.append(f"CORR REGIME   : {confirmation.correlation_regime.regime}")
+            lines.append("CONFIRMATION REASONS:")
+            for r in confirmation.reasons:
+                lines.append(f"  - {r}")
+        lines.append("")
+        lines.append(f"STRATEGY       : {evaluation.strategy.value if evaluation else 'NO_TRADE'}")
+        lines.append(f"ELIGIBLE       : {evaluation.eligible if evaluation else False}")
+        lines.append(f"EXPECTED NET   : {evaluation.expected_net_value:.0f} INR" if evaluation else "EXPECTED NET   : 0")
+        lines.append(f"CONFIDENCE     : {evaluation.confidence_score:.2f}" if evaluation else "CONFIDENCE     : 0")
+        lines.append(f"RISK/REWARD    : {evaluation.risk_reward:.2f}" if evaluation else "RISK/REWARD    : 0")
+        lines.append("")
+        lines.append("REASONS:")
         if evaluation:
             for r in evaluation.reasons:
                 lines.append(f"  - {r}")
