@@ -642,6 +642,21 @@ class Engine:
             mae_mfe = self.mae_mfe  # fallback to singleton (legacy)
         mae_mfe_record = mae_mfe.finalize(pos, actual_exit_price, net)
 
+        # Emit THESIS_INVALIDATED alert when structure invalidation fires
+        # (Layer 2 protection — thesis is no longer valid)
+        if "STRUCTURE" in reason.upper() or "INVALIDATION" in reason.upper():
+            self.notifier.send_alert(
+                AlertType.THESIS_INVALIDATED,
+                f"Thesis Invalidated — {pos.strategy.value}",
+                fields={
+                    "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
+                    "Trigger": reason,
+                    "Net P&L": f"₹{net:+,.0f}",
+                    "Spot": f"₹{snapshot.index.ltp:,.0f}",
+                },
+                description=f"Layer 2 protection fired: {reason}. The original thesis is no longer valid — exiting before the hard monetary stop.",
+            )
+
         # Emit EXIT alert
         self.notifier.send_alert(
             AlertType.EXIT,
