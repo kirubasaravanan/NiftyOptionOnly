@@ -13,7 +13,7 @@ DESIGN RULES:
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from ..models import (
@@ -22,6 +22,7 @@ from ..models import (
 from ..config import load as load_config
 from ..utils.time_utils import ist_now, is_market_open, current_time_bucket
 from .broker_interface import BrokerError, BrokerInterface, NoDataError
+from ..features.technical import attach_features_to_index
 
 
 # Lazy import — engine should run even if dhanhq is not installed
@@ -60,6 +61,10 @@ class DhanBroker(BrokerInterface):
         self._oc = None                  # OptionChain
         self._mf = None                  # MarketFeed (lazy)
         self._connected = False
+        self._last_chain_spot: Optional[float] = None  # live spot from last option-chain fetch
+        self._tech_features_cache: Optional[dict] = None
+        self._tech_features_cache_ts: float = 0.0
+        self.TECH_FEATURES_TTL_SECONDS = 120.0
 
         if not self._token or not self._client_id:
             return
@@ -274,13 +279,18 @@ class DhanBroker(BrokerInterface):
         self._require()
         # Get list of expiries first
         try:
-            exp_resp = self._oc.expiry_list(NIFTY_INDEX_SECURITY_ID, NIFTY_INDEX_EXCHANGE)
+            exp_resp = self._oc.expiry_list(int(NIFTY_INDEX_SECURITY_ID), NIFTY_INDEX_EXCHANGE)
         except Exception as exc:
             raise NoDataError(f"expiry_list fetch failed: {type(exc).__name__}") from exc
         if exp_resp.get("status") != "success":
             raise NoDataError(f"expiry_list failed: {exp_resp.get('remarks')}")
 
         exp_data = exp_resp.get("data", "")
+        # The SDK's response wrapper double-nests: exp_resp["data"] is itself
+        # {"data": [...], "status": "success"} from DhanHQ's raw body, not the
+        # flat expiry list directly. Unwrap one more level when present.
+        if isinstance(exp_data, dict) and "data" in exp_data:
+            exp_data = exp_data["data"]
         if not exp_data:
             raise NoDataError("no expiries returned (market holiday?)")
 
@@ -303,7 +313,7 @@ class DhanBroker(BrokerInterface):
         # Fetch option chain for that expiry
         try:
             oc_resp = self._oc.option_chain(
-                NIFTY_INDEX_SECURITY_ID, NIFTY_INDEX_EXCHANGE, target_code,
+                int(NIFTY_INDEX_SECURITY_ID), NIFTY_INDEX_EXCHANGE, target_code,
             )
         except Exception as exc:
             raise NoDataError(f"option_chain fetch failed: {type(exc).__name__}") from exc
@@ -311,10 +321,60 @@ class DhanBroker(BrokerInterface):
             raise NoDataError(f"option_chain failed: {oc_resp.get('remarks')}")
 
         raw = oc_resp.get("data", "")
+        # Same double-nesting as expiry_list — unwrap the inner "data" key.
+        if isinstance(raw, dict) and "data" in raw and "oc" not in raw:
+            raw = raw["data"]
         if not raw:
             raise NoDataError("option chain returned empty data")
 
+        # The option chain payload carries the underlying's genuinely live
+        # price (raw["last_price"]) — capture it so get_snapshot() can use it
+        # in place of the index quote's stale daily-candle value (see
+        # get_index_quote: it reads today's historical daily candle "close",
+        # which does not track intraday movement). No extra API call needed —
+        # this chain fetch already happens every cycle.
+        if isinstance(raw, dict):
+            live_spot = raw.get("last_price")
+            if live_spot:
+                try:
+                    self._last_chain_spot = float(live_spot)
+                except (TypeError, ValueError):
+                    pass
+
         return self._parse_option_chain(raw, underlying, target_expiry)
+
+    def _apply_cached_technicals(self, index: IndexQuote, underlying: str, now: datetime) -> None:
+        """Attach ADX/RSI/EMA/ATR/VWAP to `index`, using a cached feature set
+        when fresh enough. Never raises — a failed/rate-limited fetch just
+        means the fields stay whatever the cache (or None) already has."""
+        import time
+        age = time.monotonic() - self._tech_features_cache_ts
+        if self._tech_features_cache is None or age > self.TECH_FEATURES_TTL_SECONDS:
+            # This lands after several other DhanHQ calls already made this
+            # cycle (index, VIX, Bank Nifty, futures, option chain) and can
+            # trip a short burst-rate limit even though the same call succeeds
+            # in isolation. It only needs to succeed once per TTL window, so
+            # one short-delay retry is cheap insurance against that.
+            for attempt in range(2):
+                try:
+                    bar_start = now - timedelta(days=5)
+                    df = self.historical_candles(underlying, "5min", bar_start, now)
+                    attach_features_to_index(index, df)
+                    self._tech_features_cache = {
+                        "atr": index.atr, "adx": index.adx, "adx_slope": index.adx_slope,
+                        "rsi": index.rsi, "ema_fast": index.ema_fast,
+                        "ema_mid": index.ema_mid, "ema_slow": index.ema_slow,
+                        "vwap": index.vwap,
+                    }
+                    self._tech_features_cache_ts = time.monotonic()
+                    return
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(1.5)
+                    # else fall through to serving the stale cache, if any
+        if self._tech_features_cache:
+            for field, value in self._tech_features_cache.items():
+                setattr(index, field, value)
 
     def get_snapshot(
         self,
@@ -392,6 +452,33 @@ class DhanBroker(BrokerInterface):
             chain = self.get_option_chain(
                 underlying=underlying, n_strikes_each_side=n_strikes_each_side,
             )
+            # FIX: get_index_quote() reads today's historical daily candle
+            # "close", which does not update through the trading day — it was
+            # measured staying frozen at the market-open value for hours.
+            # The option chain response's own last_price is genuinely live
+            # (DhanHQ refreshes it every request), so use it as the real spot
+            # whenever we have it, rather than the stale daily-candle value.
+            if self._last_chain_spot and self._last_chain_spot > 0:
+                index.ltp = self._last_chain_spot
+                index.last_updated = now
+
+            # FIX: ADX/RSI/EMA/ATR/VWAP were only ever computed in the backtest
+            # engine — the live snapshot path never called TechnicalCalculator
+            # at all, so these fields stayed None on every live cycle forever.
+            # The regime engine then read the missing ADX as a literal 0.0 and
+            # EMA/VWAP as literally equal to spot, which structurally prevents
+            # it from ever classifying a genuine trending (BULL/BEAR) regime —
+            # only the OI-wall-based BREAKOUT check (a separate signal) could
+            # ever fire.
+            #
+            # Cached with its own TTL rather than fetched every cycle: 5-minute
+            # bar features don't change meaningfully faster than that anyway,
+            # and fetching a 5-day intraday window on every single decision
+            # cycle — on top of the option chain + VIX + Bank Nifty + futures
+            # calls already made above — was tripping DhanHQ's rate limiting
+            # (confirmed live: identical call succeeds alone, fails when
+            # bursted right after those other calls).
+            self._apply_cached_technicals(index, underlying, now)
         except NoDataError as exc:
             snap = MarketSnapshot(
                 timestamp=now,
@@ -535,6 +622,12 @@ class DhanBroker(BrokerInterface):
                             d = datetime.fromisoformat(d.replace("Z", "+00:00")).date() \
                                 if "T" in d else datetime.strptime(d, "%Y-%m-%d").date()
                         out.append({"date": d, "code": c})
+                elif isinstance(item, str):
+                    # Current DhanHQ v2 API returns a flat list of expiry date
+                    # strings (no separate "code") — the string itself is what
+                    # /optionchain expects back as the Expiry parameter.
+                    d = datetime.strptime(item, "%Y-%m-%d").date()
+                    out.append({"date": d, "code": item})
             except Exception:
                 continue
         # Sort by date ascending
@@ -585,30 +678,45 @@ class DhanBroker(BrokerInterface):
             if side is None:
                 side = rec.get("option_type", "CE")
             ot = OptionType.CE if str(side).upper() in ("CE", "CALL") else OptionType.PE
+            # DhanHQ's live option-chain response has no "symbol"/"trading_symbol"
+            # field — only a numeric security_id, which isn't a valid string for
+            # OptionQuote.symbol (Pydantic ValidationError, silently swallowed
+            # below as a ValueError subclass) and isn't human-readable anyway.
+            # Always build a readable synthetic symbol instead.
             sym = (rec.get("symbol") or rec.get("trading_symbol")
-                   or rec.get("security_id")
                    or f"{underlying}{expiry.strftime('%y%b').upper()}{int(strike)}{side.upper()}")
+            # The actual DhanHQ instrument ID — required to place/track/reconcile
+            # a real order against this specific contract (Phase 9). None for
+            # synthetic/backtest quotes that don't have one.
+            sec_id_raw = rec.get("security_id")
+            security_id = int(sec_id_raw) if sec_id_raw is not None else None
             ltp = float(rec.get("last_price", rec.get("ltp", 0)) or 0)
             if ltp <= 0:
                 return None
             iv_raw = float(rec.get("implied_volatility", rec.get("iv", 0)) or 0)
+            # DhanHQ's live response nests Greeks under "greeks" and uses
+            # top_bid_price/top_ask_price rather than flat bid/ask — fall back
+            # to the flat names too, for compatibility with other chain shapes
+            # (e.g. the backtest engine's Black-Scholes-synthesised chain).
+            greeks = rec.get("greeks") or {}
             return OptionQuote(
                 symbol=sym,
+                security_id=security_id,
                 exchange="NSE",
                 expiry=expiry,
                 strike=strike,
                 option_type=ot,
                 ltp=ltp,
-                bid=float(rec.get("bid", 0) or 0) or None,
-                ask=float(rec.get("ask", 0) or 0) or None,
+                bid=float(rec.get("top_bid_price", rec.get("bid", 0)) or 0) or None,
+                ask=float(rec.get("top_ask_price", rec.get("ask", 0)) or 0) or None,
                 volume=int(rec.get("volume", rec.get("traded_volume", 0)) or 0),
                 oi=int(rec.get("oi", rec.get("open_interest", 0)) or 0),
                 oi_change=int(rec.get("oi_change", 0) or 0),
                 iv=(iv_raw / 100.0) if iv_raw > 0 else None,
-                delta=float(rec.get("delta", 0) or 0) or None,
-                gamma=float(rec.get("gamma", 0) or 0) or None,
-                theta=float(rec.get("theta", 0) or 0) or None,
-                vega=float(rec.get("vega", 0) or 0) or None,
+                delta=float(greeks.get("delta", rec.get("delta", 0)) or 0) or None,
+                gamma=float(greeks.get("gamma", rec.get("gamma", 0)) or 0) or None,
+                theta=float(greeks.get("theta", rec.get("theta", 0)) or 0) or None,
+                vega=float(greeks.get("vega", rec.get("vega", 0)) or 0) or None,
                 last_updated=now,
             )
         except (TypeError, ValueError, KeyError):

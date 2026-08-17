@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from ..models import OptionQuote, Position, RunMode
+from ..models import MarketRegime, OptionQuote, Position, RunMode, VolatilityRegime
 
 
 @dataclass
@@ -40,6 +40,9 @@ class OrderRequest:
     max_loss: Optional[float] = None
     max_gain: Optional[float] = None
     breakeven: Optional[float] = None
+    # For the trade journal (TradeRecord requires these at exit):
+    regime_at_entry: Optional[MarketRegime] = None
+    vol_regime_at_entry: Optional[VolatilityRegime] = None
 
 
 @dataclass
@@ -166,6 +169,8 @@ class OrderManager:
             take_profit=req.take_profit,
             current_price=fill,
             unrealised_pnl=0.0,
+            regime_at_entry=req.regime_at_entry,
+            vol_regime_at_entry=req.vol_regime_at_entry,
         )
         self._positions.append(position)
         return OrderResult(
@@ -217,6 +222,8 @@ class OrderManager:
             max_gain=req.max_gain,
             breakeven=req.breakeven,
             unrealised_pnl=0.0,
+            regime_at_entry=req.regime_at_entry,
+            vol_regime_at_entry=req.vol_regime_at_entry,
         )
         self._positions.append(position)
         return OrderResult(

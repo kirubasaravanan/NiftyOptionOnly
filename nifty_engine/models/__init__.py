@@ -84,6 +84,10 @@ class TimeBucket(str, Enum):
 class OptionQuote(BaseModel):
     model_config = ConfigDict(frozen=False)
     symbol: str
+    security_id: Optional[int] = None       # DhanHQ's own instrument ID — required
+                                             # to place/track/reconcile a real order
+                                             # against this exact contract. None for
+                                             # backtest/synthetic quotes.
     exchange: str = "NSE"
     expiry: date
     strike: float
@@ -256,6 +260,8 @@ class Position(BaseModel):
     lots: int
     entry_price: float                                # for single-leg: premium; for spread: net debit
     entry_time: datetime
+    regime_at_entry: Optional[MarketRegime] = None   # for the trade journal (TradeRecord requires it)
+    vol_regime_at_entry: Optional[VolatilityRegime] = None
     side: Literal["BUY", "SELL"] = "BUY"
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None

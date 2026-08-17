@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from ..models import MarketSnapshot, OptionQuote
+from ..data.option_chain import OptionChainBuilder
 
 
 @dataclass
@@ -44,8 +45,16 @@ class Reconciler:
                 reason=f"stale data ({age:.0f}s old)",
                 emergency_action="SHUTDOWN",
             )
-        # Spread check on ATM options
-        for q in snapshot.option_chain:
+        # Spread check on ATM options only. Deep ITM/OTM strikes are always
+        # thinly traded with wide or stale bid/ask — checking the full chain
+        # (as this used to do, despite the comment above) means any real
+        # 200+ strike chain trips this on an irrelevant far strike almost
+        # every cycle, emergency-shutting the engine down for the rest of
+        # the session over a contract nothing would ever trade.
+        atm_window = OptionChainBuilder.filter_atm_window(
+            snapshot.option_chain, snapshot.index.ltp, n_each_side=5,
+        )
+        for q in atm_window:
             if q.bid and q.ask:
                 spread = q.ask - q.bid
                 if spread > self.ABNORMAL_SPREAD_POINTS:

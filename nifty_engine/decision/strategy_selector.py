@@ -71,6 +71,16 @@ class StrategySelector:
                     eligible=False,
                     reasons=[f"evaluation error: {type(exc).__name__}: {exc}"],
                 )
+            # BREAKOUT is direction-ambiguous by design (market_regime.py uses the
+            # same label for a bullish break above the call wall and a bearish
+            # break below the put wall) — LongCall/LongPut/DebitSpread all list
+            # BREAKOUT as an eligible regime for their own fixed direction with
+            # no check on which wall actually broke. Without this filter, a
+            # bearish put-wall break can leave LONG_CALL eligible (or vice versa)
+            # purely because it separately clears its net-value/confidence/RR bar.
+            if (regime.market_regime.value == "BREAKOUT" and ev.eligible
+                    and ev.strategy != StrategyName.NO_TRADE):
+                ev = self._filter_breakout_direction(ev, regime, confirmation, snapshot)
             # Apply confirmation-score adjustment to eligible directional strategies
             if confirmation is not None and ev.eligible and ev.strategy != StrategyName.NO_TRADE:
                 ev = self._apply_confirmation(ev, confirmation, s)
@@ -132,6 +142,33 @@ class StrategySelector:
         # Default: pick highest expected_net_value; tiebreak by confidence
         chosen = max(eligible, key=lambda e: (e.expected_net_value, e.confidence_score))
         return chosen, all_evals
+
+    @staticmethod
+    def _filter_breakout_direction(
+        ev: StrategyEvaluation,
+        regime: RegimeAssessment,
+        confirmation: Optional[ConfirmationScore],
+        snapshot: MarketSnapshot,
+    ) -> StrategyEvaluation:
+        """Reject a BREAKOUT-eligible strategy whose direction doesn't match
+        which wall actually broke (see the comment at the call site)."""
+        if confirmation is None or ev.direction not in ("BULLISH", "BEARISH"):
+            return ev
+        oi = confirmation.oi_classification
+        spot = snapshot.index.ltp
+        real_direction = None
+        if oi.call_wall and spot > oi.call_wall:
+            real_direction = "BULLISH"
+        elif oi.put_wall and spot < oi.put_wall:
+            real_direction = "BEARISH"
+        if real_direction and ev.direction != real_direction:
+            ev.eligible = False
+            ev.reasons.append(
+                f"BREAKOUT direction mismatch: strategy is {ev.direction} but "
+                f"spot {spot} vs call_wall={oi.call_wall}/put_wall={oi.put_wall} "
+                f"shows {real_direction}"
+            )
+        return ev
 
     @staticmethod
     def _apply_confirmation(

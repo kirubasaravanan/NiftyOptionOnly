@@ -8,6 +8,7 @@ specified by the spec (section 28).
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -26,7 +27,7 @@ from .features.correlation import (
 from .journal import DecisionLogger, TradeLogger
 from .models import (
     Decision, DecisionAction, MarketSnapshot, RunMode, StrategyName,
-    Position, OptionQuote,
+    Position, OptionQuote, TradeRecord, MarketRegime, VolatilityRegime, OptionType,
 )
 from .notifier import (
     DiscordNotifier, AlertType, AlertLevel,
@@ -309,6 +310,8 @@ class Engine:
                 max_loss=max_loss,
                 max_gain=max_gain,
                 breakeven=breakeven,
+                regime_at_entry=regime_assessment.market_regime,
+                vol_regime_at_entry=regime_assessment.volatility_regime,
             )
             order_result = self.order_manager.submit(order_req)
             if not order_result.success:
@@ -469,27 +472,43 @@ class Engine:
             # Update swing high/low
             protection.update_swing(snapshot)
 
-            # Update mark-to-market
+            # Update mark-to-market.
+            #
+            # FIX: previously always synthesised via Black-Scholes with a
+            # hardcoded t=7/365 (7 days to expiry) regardless of the position's
+            # real expiry — for a 1-DTE contract this inflated the modelled
+            # price by 4x+ versus the real market (verified live: engine showed
+            # ~₹219 against a real quoted ~₹49). Layer-1's stop is a loss-side
+            # check, so an inflated "profit" like that can mask a real loss.
+            #
+            # Now: prefer the REAL live quote for this exact strike/type from
+            # the current option chain (already fetched fresh every cycle) —
+            # no approximation needed when the real number is right there.
+            # Black-Scholes is only a fallback for when the exact contract
+            # isn't present in this cycle's chain, and even then uses the
+            # position's actual time-to-expiry instead of a hardcoded value.
             current_price = pos.current_price or pos.entry_price
             if hasattr(snapshot, "index") and snapshot.index.ltp > 0:
                 try:
-                    from .backtest.engine import bs_option_price
-                    t = 7.0 / 365.0
+                    from .data.option_chain import OptionChainBuilder
 
-                    # FIX: For spreads, compute net-debit current price
-                    # using BOTH legs, not just the long leg.
+                    def _reprice(leg):
+                        live = OptionChainBuilder.pick_quote_by_type(
+                            snapshot.option_chain, leg.strike, leg.option_type,
+                        )
+                        if live is not None and live.ltp > 0:
+                            return live.ltp
+                        from .backtest.engine import bs_option_price
+                        days_left = (leg.expiry - now.date()).days
+                        t = max(days_left, 0.5) / 365.0
+                        return max(0.05, bs_option_price(
+                            snapshot.index.ltp, leg.strike, t,
+                            leg.iv or 0.15, 0.07, leg.option_type,
+                        ))
+
                     if pos.long_leg is not None and pos.short_leg is not None:
-                        # Reprice both legs via BS
-                        long_current = bs_option_price(
-                            snapshot.index.ltp, pos.long_leg.strike, t,
-                            pos.long_leg.iv or 0.15, 0.07, pos.long_leg.option_type,
-                        )
-                        short_current = bs_option_price(
-                            snapshot.index.ltp, pos.short_leg.strike, t,
-                            pos.short_leg.iv or 0.15, 0.07, pos.short_leg.option_type,
-                        )
-                        long_current = max(0.05, long_current)
-                        short_current = max(0.05, short_current)
+                        long_current = _reprice(pos.long_leg)
+                        short_current = _reprice(pos.short_leg)
                         # Net debit = long - short (what we'd pay to close)
                         current_net_debit = max(0.01, long_current - short_current)
                         pos.long_leg_current = long_current
@@ -499,12 +518,7 @@ class Engine:
                         pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * get_lot_size()
                         current_price = current_net_debit
                     else:
-                        # Single-leg: reprice via BS
-                        new_price = bs_option_price(
-                            snapshot.index.ltp, pos.option.strike, t,
-                            pos.option.iv or 0.15, 0.07, pos.option.option_type,
-                        )
-                        current_price = max(0.05, new_price)
+                        current_price = _reprice(pos.option)
                         pos.current_price = current_price
                         pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * get_lot_size()
                 except Exception:
@@ -672,6 +686,37 @@ class Engine:
         # (daily P&L, trade count, consecutive losses, cooldown)
         self.risk.record_trade_result(net, now)
         self.risk.release_open_exposure(pos.entry_price * qty)
+
+        # FIX: persist the completed trade to trades.jsonl. TradeLogger was
+        # instantiated but never actually called anywhere — record_trade_result()
+        # above updates the in-memory risk counters, but nothing wrote the trade
+        # itself to disk, so the journal (and /api/journal/trades) always showed
+        # zero trades regardless of how many real round-trips happened.
+        try:
+            leg = pos.option or pos.long_leg
+            holding_minutes = int((now - pos.entry_time).total_seconds() // 60)
+            self.trade_logger.log_trade(TradeRecord(
+                trade_id=uuid.uuid4().hex[:12],
+                entry_time=pos.entry_time,
+                exit_time=now,
+                strategy=pos.strategy,
+                regime_at_entry=pos.regime_at_entry or MarketRegime.NEUTRAL,
+                vol_regime_at_entry=pos.vol_regime_at_entry or VolatilityRegime.NORMAL_VOL,
+                option_symbol=leg.symbol if leg else "—",
+                strike=leg.strike if leg else 0.0,
+                option_type=leg.option_type if leg else OptionType.CE,
+                expiry=leg.expiry if leg else now.date(),
+                lots=pos.lots,
+                entry_price=pos.entry_price,
+                exit_price=actual_exit_price,
+                gross_pnl=gross,
+                charges=cost,
+                net_pnl=net,
+                exit_reason=reason,
+                holding_minutes=holding_minutes,
+            ))
+        except Exception:
+            pass  # never let journal persistence break a live exit
 
         # Finalize MAE/MFE (use per-position tracker if available, else fallback)
         pos_key = id(pos)

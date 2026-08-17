@@ -131,7 +131,24 @@ class ThesisTracker:
         # If direction not explicitly passed, derive from current regime
         # (enables REVERSAL detection on periodic calls)
         if direction is None:
-            if regime.market_regime.value in ("STRONG_BULL", "BULL", "WEAK_BULL", "BREAKOUT"):
+            if regime.market_regime.value == "BREAKOUT":
+                # BREAKOUT is direction-ambiguous by design: the regime engine
+                # (market_regime.py) uses this exact same label for a bullish
+                # break above the call wall AND a bearish break below the put
+                # wall. Assuming bullish here force-exits every bearish
+                # breakout position (e.g. a correctly-entered LONG_PUT) as a
+                # false "reversal" on its very first monitoring cycle, even
+                # with zero real market movement. Disambiguate using the same
+                # OI-wall comparison the regime engine itself used.
+                oi = confirmation.oi_classification if confirmation else None
+                spot = snapshot.index.ltp
+                if oi and oi.call_wall and spot > oi.call_wall:
+                    direction = "BULLISH"
+                elif oi and oi.put_wall and spot < oi.put_wall:
+                    direction = "BEARISH"
+                else:
+                    direction = self.entry_direction or "NEUTRAL"
+            elif regime.market_regime.value in ("STRONG_BULL", "BULL", "WEAK_BULL"):
                 direction = "BULLISH"
             elif regime.market_regime.value in ("STRONG_BEAR", "BEAR", "WEAK_BEAR"):
                 direction = "BEARISH"

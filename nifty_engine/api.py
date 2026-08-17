@@ -330,6 +330,7 @@ def status():
             {
                 "strategy": p.strategy.value,
                 "option": p.option.symbol if p.option else (p.long_leg.symbol if p.long_leg else "—"),
+                "security_id": (p.option.security_id if p.option else (p.long_leg.security_id if p.long_leg else None)),
                 "strike": (p.option.strike if p.option else (p.long_leg.strike if p.long_leg else 0)),
                 "option_type": (p.option.option_type.value if p.option else (p.long_leg.option_type.value if p.long_leg else "—")),
                 "lots": p.lots,
@@ -342,7 +343,9 @@ def status():
                 # Phase 10: spread fields
                 "is_spread": p.long_leg is not None and p.short_leg is not None,
                 "long_leg": p.long_leg.symbol if p.long_leg else None,
+                "long_leg_security_id": p.long_leg.security_id if p.long_leg else None,
                 "short_leg": p.short_leg.symbol if p.short_leg else None,
+                "short_leg_security_id": p.short_leg.security_id if p.short_leg else None,
                 "spread_width": p.spread_width,
                 "max_loss": p.max_loss,
                 "max_gain": p.max_gain,
