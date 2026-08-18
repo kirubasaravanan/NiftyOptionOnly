@@ -24,9 +24,9 @@ from .features.correlation import (
     BankNiftyCalculator, CorrelationRegimeDetector,
     ConfirmationScoreCalculator, compute_all_confirmations,
 )
-from .journal import DecisionLogger, TradeLogger
+from .journal import DecisionLogger, MarketSnapshotLogger, TradeLogger
 from .models import (
-    Decision, DecisionAction, MarketSnapshot, RunMode, StrategyName,
+    Decision, DecisionAction, MarketSnapshot, RegimeAssessment, RunMode, StrategyName,
     Position, OptionQuote, TradeRecord, MarketRegime, VolatilityRegime, OptionType,
 )
 from .notifier import (
@@ -70,6 +70,7 @@ class Engine:
 
         self.trade_logger = TradeLogger(runs_dir=runs_dir)
         self.decision_logger = DecisionLogger(runs_dir=runs_dir)
+        self.snapshot_logger = MarketSnapshotLogger(runs_dir=runs_dir)
 
         # --- Phase 8: notifier + thesis + protection + MAE/MFE ---
         self.notifier = get_notifier()
@@ -78,6 +79,8 @@ class Engine:
         self.mae_mfe = MAEMFETracker()
         self._last_regime: Optional[str] = None
         self._last_alerted_setup: Optional[str] = None
+        self._last_snapshot_saved_ts: Optional[datetime] = None
+        self.SNAPSHOT_INTERVAL_MINUTES = 15  # fallback cadence when regime is stable
 
         self._day_initialised: Optional[datetime] = None
 
@@ -127,7 +130,11 @@ class Engine:
         regime_assessment = self.regime.assess(snapshot)
 
         # Emit REGIME_CHANGE alert when regime transitions
-        if self._last_regime is not None and regime_assessment.market_regime.value != self._last_regime:
+        regime_changed = (
+            self._last_regime is not None
+            and regime_assessment.market_regime.value != self._last_regime
+        )
+        if regime_changed:
             self.notifier.send_alert(
                 AlertType.REGIME_CHANGE,
                 f"Regime Change: {self._last_regime} → {regime_assessment.market_regime.value}",
@@ -144,6 +151,9 @@ class Engine:
                 description=f"Market regime has shifted from **{self._last_regime}** to **{regime_assessment.market_regime.value}**. Strategy selector will now evaluate candidates for this new regime.",
             )
         self._last_regime = regime_assessment.market_regime.value
+
+        # ---- observational market-snapshot logging (never affects trading) ----
+        self._maybe_save_market_snapshot(snapshot, regime_assessment, now, regime_changed)
 
         # ---- 4b. compute cross-market confirmation (Layer 3 + 4) ----
         # Correlation itself is NEVER a buy signal — it modulates confidence.
@@ -384,8 +394,50 @@ class Engine:
         )
 
         # ---- 10. journal ----
-        self.decision_logger.log_decision(decision, self._snapshot_summary(snapshot))
+        self.decision_logger.log_decision(
+            decision, self._snapshot_summary(snapshot),
+            all_evaluations=self._summarise_evaluations(all_evals),
+            confirmation_summary=self._summarise_confirmation(confirmation),
+        )
         return decision
+
+    @staticmethod
+    def _summarise_evaluations(all_evals) -> list[dict]:
+        return [
+            {
+                "strategy": ev.strategy.value,
+                "eligible": ev.eligible,
+                "direction": ev.direction,
+                "expected_net_value": ev.expected_net_value,
+                "confidence_score": ev.confidence_score,
+                "risk_reward": ev.risk_reward,
+                "required_move_points": ev.required_move_points,
+            }
+            for ev in (all_evals or [])
+        ]
+
+    @staticmethod
+    def _summarise_confirmation(confirmation) -> Optional[dict]:
+        if confirmation is None:
+            return None
+        try:
+            return {
+                "score": confirmation.score,
+                "vix": confirmation.vix_valuation.vix,
+                "vix_valuation": confirmation.vix_valuation.valuation,
+                "iv_vix_gap": confirmation.vix_valuation.iv_vix_gap,
+                "ce_oi_class": confirmation.oi_classification.ce_classification,
+                "pe_oi_class": confirmation.oi_classification.pe_classification,
+                "call_wall": confirmation.oi_classification.call_wall,
+                "put_wall": confirmation.oi_classification.put_wall,
+                "futures_interpretation": confirmation.futures_basis.interpretation,
+                "futures_basis_pct": confirmation.futures_basis.basis_pct,
+                "banknifty_correlation": confirmation.banknifty_confirmation.correlation_state,
+                "banknifty_change_pct": confirmation.banknifty_confirmation.banknifty_change_pct,
+                "correlation_regime": confirmation.correlation_regime.regime,
+            }
+        except Exception:
+            return None
 
     def _compute_confirmation(self, snapshot: MarketSnapshot, regime):
         """Compute cross-market confirmation score.
@@ -896,6 +948,71 @@ class Engine:
             "time_bucket": snapshot.time_bucket.value if snapshot.time_bucket else None,
             "vix": snapshot.india_vix.ltp if snapshot.india_vix else None,
             "chain_size": len(snapshot.option_chain),
+        }
+
+    def _maybe_save_market_snapshot(
+        self,
+        snapshot: MarketSnapshot,
+        regime: RegimeAssessment,
+        now: datetime,
+        regime_changed: bool,
+    ) -> None:
+        """Observational only — never read by any trading logic, so a failure
+        or skip here can never affect a decision. Saves a compact ATM-window
+        option-chain slice on every regime change (high-signal moments) plus
+        a time-based fallback so long stable stretches still get sampled,
+        without writing the full ~200-quote chain every single cycle."""
+        if not snapshot.data_valid or not snapshot.option_chain:
+            return
+        due_for_interval = (
+            self._last_snapshot_saved_ts is None
+            or (now - self._last_snapshot_saved_ts).total_seconds() >= self.SNAPSHOT_INTERVAL_MINUTES * 60
+        )
+        if not (regime_changed or due_for_interval):
+            return
+        try:
+            record = self._build_snapshot_record(
+                snapshot, regime, now,
+                trigger="regime_change" if regime_changed else "interval",
+            )
+            self.snapshot_logger.log_snapshot(record)
+            self._last_snapshot_saved_ts = now
+        except Exception:
+            pass  # observational logging must never break a decision cycle
+
+    @staticmethod
+    def _build_snapshot_record(
+        snapshot: MarketSnapshot, regime: RegimeAssessment, now: datetime, trigger: str,
+    ) -> dict:
+        from .data.option_chain import OptionChainBuilder
+        spot = snapshot.index.ltp
+        chain = OptionChainBuilder.filter_atm_window(snapshot.option_chain, spot, n_each_side=10)
+        return {
+            "timestamp": now.isoformat(),
+            "trigger": trigger,
+            "regime": regime.market_regime.value,
+            "volatility": regime.volatility_regime.value,
+            "confidence": regime.confidence,
+            "spot": spot,
+            "vix": snapshot.india_vix.ltp if snapshot.india_vix else None,
+            "atr": snapshot.index.atr,
+            "adx": snapshot.index.adx,
+            "chain": [
+                {
+                    "strike": q.strike,
+                    "type": q.option_type.value if q.option_type else None,
+                    "ltp": q.ltp,
+                    "bid": q.bid,
+                    "ask": q.ask,
+                    "oi": q.oi,
+                    "iv": q.iv,
+                    "delta": q.delta,
+                    "gamma": q.gamma,
+                    "theta": q.theta,
+                    "vega": q.vega,
+                }
+                for q in chain
+            ],
         }
 
     @staticmethod

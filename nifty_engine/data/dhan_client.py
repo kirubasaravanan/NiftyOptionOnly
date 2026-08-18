@@ -449,9 +449,29 @@ class DhanBroker(BrokerInterface):
         nf = self.get_nifty_futures_quote()
 
         try:
-            chain = self.get_option_chain(
-                underlying=underlying, n_strikes_each_side=n_strikes_each_side,
-            )
+            chain = None
+            last_chain_exc: Optional[NoDataError] = None
+            # 3 attempts, not 2: confirmed live (2026-08-18, 12:40 IST) that a
+            # single retry can still land inside the same burst window when
+            # /api/snapshot's own 30s cache and /api/decision's engine-cycle
+            # cache both happen to refresh close together, roughly doubling
+            # the API calls DhanHQ sees in a short span. A light backoff
+            # (1.5s, then 2.5s) spreads the two retries further apart than a
+            # fixed delay would, on the theory that a doubled-up burst is a
+            # short-lived coincidence, not a sustained rate limit.
+            for attempt in range(3):
+                try:
+                    chain = self.get_option_chain(
+                        underlying=underlying, n_strikes_each_side=n_strikes_each_side,
+                    )
+                    break
+                except NoDataError as exc:
+                    last_chain_exc = exc
+                    if attempt < 2:
+                        import time
+                        time.sleep(1.5 if attempt == 0 else 2.5)
+            if chain is None:
+                raise last_chain_exc
             # FIX: get_index_quote() reads today's historical daily candle
             # "close", which does not update through the trading day — it was
             # measured staying frozen at the market-open value for hours.

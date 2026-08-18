@@ -196,6 +196,10 @@ class DebitSpreadStrategy(StrategyBase):
             confidence = min(1.0, confidence + 0.05)
             vol_bonus_reason = " (VIX expensive → spread preferred over outright long)"
 
+        # net_delta drives the spread's P&L sensitivity to underlying move,
+        # same role delta plays for outright long strategies
+        required_move = self._required_move_points(net_delta, expected_theta_loss, cost, qty)
+
         reasons = [
             f"regime={regime.market_regime.value} (conf {regime.confidence:.2f})",
             f"vol={regime.volatility_regime.value}{vol_bonus_reason}",
@@ -208,6 +212,16 @@ class DebitSpreadStrategy(StrategyBase):
             f"theta_loss={expected_theta_loss:.2f}  gross={gross_total:.0f}  cost={cost:.0f}",
             f"expected_net={expected_net:.0f}  conf={confidence:.2f}",
         ]
+        if required_move is not None:
+            reasons.append(
+                f"required_move={required_move:.1f}pts to clear net≥{self.min_expected_net_value:.0f} "
+                f"(expected_move={expected_move:.1f}pts)"
+            )
+        elif net_delta <= 0:
+            reasons.append(
+                "required_move=n/a (net_delta<=0 — short leg delta exceeds long leg; "
+                "spread cannot be pushed into eligibility by underlying move alone)"
+            )
 
         eligible = (
             expected_net >= self.min_expected_net_value
@@ -235,6 +249,7 @@ class DebitSpreadStrategy(StrategyBase):
             transaction_cost_estimate=cost,
             slippage_estimate=cost * 0.3,
             expected_net_value=expected_net,
+            required_move_points=required_move,
             reasons=reasons,
         )
 

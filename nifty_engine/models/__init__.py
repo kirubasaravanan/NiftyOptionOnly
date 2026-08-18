@@ -193,6 +193,9 @@ class StrategyEvaluation(BaseModel):
     transaction_cost_estimate: float = 0.0
     slippage_estimate: float = 0.0
     expected_net_value: float = 0.0            # the master number
+    required_move_points: Optional[float] = None  # underlying move (pts) needed to clear
+                                                    # min_expected_net_value, all else equal
+                                                    # (transparency; not itself a trade signal)
     reasons: list[str] = Field(default_factory=list)
 
 
@@ -311,6 +314,17 @@ class DecisionRecord(BaseModel):
     expected_net_value: float
     reasons: list[str]
     snapshot_summary: dict
+    # Observational (2026-08-18): every candidate strategy's own numbers for
+    # this cycle, not just whichever one got chosen — the chosen one is almost
+    # always the synthetic NO_TRADE result, which has no expected_net_value or
+    # required_move_points of its own. Without this, a bearish strategy's
+    # near-miss numbers (e.g. LONG_PUT's expected_net / required_move on a day
+    # that never traded) were computed every cycle and then discarded.
+    all_evaluations: list[dict] = Field(default_factory=list)
+    # Cross-market confirmation (VIX valuation, OI walls, futures basis,
+    # BankNifty correlation) — also computed every cycle and previously only
+    # used transiently to adjust confidence, never persisted.
+    confirmation_summary: Optional[dict] = None
 
 
 __all__ = [

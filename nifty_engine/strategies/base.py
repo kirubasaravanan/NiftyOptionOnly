@@ -83,3 +83,22 @@ class StrategyBase(ABC):
         quantity: int,
     ) -> float:
         return self._cost_model.estimate_round_trip_cost(entry_premium, quantity)
+
+    def _required_move_points(
+        self,
+        delta: float,
+        theta_loss: float,
+        cost: float,
+        qty: int,
+    ) -> Optional[float]:
+        """Underlying move (points) needed for this evaluation to clear
+        min_expected_net_value, holding delta/theta_loss/cost/qty fixed.
+
+        Derived from expected_net = (delta * move - theta_loss) * qty - cost,
+        solved for move where expected_net == min_expected_net_value. Pass
+        net_delta for spreads (long_delta - short_delta). Returns None when
+        delta <= 0 — no move size clears the bar in that case.
+        """
+        if delta <= 0 or qty <= 0:
+            return None
+        return theta_loss / delta + (self.min_expected_net_value + cost) / (delta * qty)

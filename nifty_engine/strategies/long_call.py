@@ -99,6 +99,8 @@ class LongCallStrategy(StrategyBase):
 
         confidence = self._confidence(regime, option, expected_net, rr)
 
+        required_move = self._required_move_points(delta, expected_theta_loss, cost, qty)
+
         reasons = [
             f"regime={regime.market_regime.value} (conf {regime.confidence:.2f})",
             f"vol={regime.volatility_regime.value}",
@@ -107,6 +109,11 @@ class LongCallStrategy(StrategyBase):
             f"theta_loss={expected_theta_loss:.2f}  gross={gross_total:.0f}  cost={cost:.0f}",
             f"expected_net={expected_net:.0f}  risk={risk:.0f}  R/R={rr:.2f}  conf={confidence:.2f}",
         ]
+        if required_move is not None:
+            reasons.append(
+                f"required_move={required_move:.1f}pts to clear net≥{self.min_expected_net_value:.0f} "
+                f"(expected_move={expected_move:.1f}pts)"
+            )
 
         eligible = (
             expected_net >= self.min_expected_net_value
@@ -132,6 +139,7 @@ class LongCallStrategy(StrategyBase):
             transaction_cost_estimate=cost,
             slippage_estimate=cost * 0.3,  # rough split
             expected_net_value=expected_net,
+            required_move_points=required_move,
             reasons=reasons,
         )
 
