@@ -31,8 +31,19 @@ class RiskDecision:
 class RiskEngine:
     """Stateful — tracks daily PnL, consecutive losses, cooldowns."""
 
-    def __init__(self, capital: float = 1_000_000.0) -> None:
-        self._cfg = load_config("risk")
+    # Config name per instrument (2026-08-18) — see StrategyBase for the
+    # same pattern; other instruments read risk_{instrument}.yaml (literal
+    # copies pending independent validation).
+    _CONFIG_NAME_BY_INSTRUMENT = {
+        "nifty": "risk",
+        "banknifty": "risk_banknifty",
+        "sensex": "risk_sensex",
+    }
+
+    def __init__(self, capital: float = 1_000_000.0, instrument: str = "nifty") -> None:
+        self._instrument = instrument.lower()
+        config_name = self._CONFIG_NAME_BY_INSTRUMENT.get(self._instrument, "risk")
+        self._cfg = load_config(config_name)
         self._capital = float(capital)
         self._day_pnl: float = 0.0
         self._day_trades: int = 0
@@ -119,7 +130,7 @@ class RiskEngine:
         # For long options, risk == premium
         per_unit_risk = option.ltp
         from ..utils.config_helpers import get_lot_size
-        lot_size = get_lot_size()
+        lot_size = get_lot_size(self._instrument)
         # compute max lots
         lots_by_risk = int(max_risk_per_trade // (per_unit_risk * lot_size)) if per_unit_risk > 0 else 0
         lots_by_premium = int(max_premium_per_trade // (per_unit_risk * lot_size)) if per_unit_risk > 0 else 0

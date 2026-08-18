@@ -27,12 +27,12 @@ from ..features.correlation import ConfirmationScore
 class StrategySelector:
     """Picks the best strategy each cycle."""
 
-    def __init__(self) -> None:
+    def __init__(self, instrument: str = "nifty") -> None:
         self._strategies = [
-            LongCallStrategy(),
-            LongPutStrategy(),
-            DebitSpreadStrategy(),
-            NoTradeStrategy(),
+            LongCallStrategy(instrument),
+            LongPutStrategy(instrument),
+            DebitSpreadStrategy(instrument),
+            NoTradeStrategy(instrument),
         ]
 
     @property

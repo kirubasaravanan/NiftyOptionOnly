@@ -14,6 +14,7 @@ from typing import Optional
 
 from .config import load as load_config
 from .data import DhanBroker, MarketCache
+from .instruments import InstrumentConfig, NIFTY
 from .decision import (
     OptionSelector, PositionManager, RegimeEngineRunner,
     RiskEngine, StrategySelector, SpreadSelector,
@@ -49,21 +50,23 @@ class Engine:
         capital: Optional[float] = None,
         runs_dir: str = "/home/z/my-project/runs",
         broker: Optional[DhanBroker] = None,
+        instrument: InstrumentConfig = NIFTY,
     ) -> None:
         self.mode = mode
+        self.instrument = instrument
         cap_env = os.environ.get("ENGINE_CAPITAL")
         self.capital = float(capital if capital is not None else (cap_env or 1_000_000))
 
         # --- wiring ---
         # Reuse the passed-in broker if provided (avoids creating a new DhanContext
         # which loads the 50MB security list CSV).
-        self.broker = broker if broker is not None else DhanBroker()
+        self.broker = broker if broker is not None else DhanBroker(instrument=instrument)
         self.cache = MarketCache(ttl_seconds=5.0)
         self.regime = RegimeEngineRunner()
-        self.selector = StrategySelector()
+        self.selector = StrategySelector(instrument=instrument.name.lower())
         self.option_selector = OptionSelector()
         self.spread_selector = SpreadSelector()
-        self.risk = RiskEngine(capital=self.capital)
+        self.risk = RiskEngine(capital=self.capital, instrument=instrument.name.lower())
         self.position_manager = PositionManager()
         self.order_manager = OrderManager(mode=mode, broker=self.broker if mode == RunMode.LIVE else None)
         self.reconciler = Reconciler()
@@ -83,6 +86,12 @@ class Engine:
         self.SNAPSHOT_INTERVAL_MINUTES = 15  # fallback cadence when regime is stable
 
         self._day_initialised: Optional[datetime] = None
+
+    def _lot_size(self) -> int:
+        """This engine's own instrument's lot size (2026-08-18) — replaces
+        bare self._lot_size() calls, which always read NIFTY's config
+        regardless of which instrument this engine actually runs."""
+        return get_lot_size(self.instrument.name.lower())
 
     # ---- public API ----
     def run_cycle(self) -> Decision:
@@ -288,10 +297,10 @@ class Engine:
 
             if is_spread:
                 # For spreads, premium = net debit * qty
-                premium_per_lot = net_debit * get_lot_size()
+                premium_per_lot = net_debit * self._lot_size()
                 total_premium = premium_per_lot * lots
             else:
-                premium_per_lot = option.ltp * get_lot_size()
+                premium_per_lot = option.ltp * self._lot_size()
                 total_premium = premium_per_lot * lots
 
             stop = risk_decision.stop_loss
@@ -305,12 +314,13 @@ class Engine:
 
             # ---- execute (paper mode fills immediately) ----
             order_req = OrderRequest(
+                instrument=self.instrument.name,
                 option=option,            # long leg for spreads
                 long_leg=long_leg,
                 short_leg=short_leg,
                 side="BUY",
                 lots=lots,
-                lot_size=get_lot_size(),  # from config, not hardcoded
+                lot_size=self._lot_size(),  # from config, not hardcoded
                 strategy=chosen_eval.strategy.value,
                 stop_loss=stop,
                 take_profit=target,
@@ -567,12 +577,12 @@ class Engine:
                         pos.short_leg_current = short_current
                         pos.current_price = current_net_debit
                         # P&L = (current net debit - entry net debit) * qty
-                        pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * get_lot_size()
+                        pos.unrealised_pnl = (current_net_debit - pos.entry_price) * pos.lots * self._lot_size()
                         current_price = current_net_debit
                     else:
                         current_price = _reprice(pos.option)
                         pos.current_price = current_price
-                        pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * get_lot_size()
+                        pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * self._lot_size()
                 except Exception:
                     pass
 
@@ -635,7 +645,7 @@ class Engine:
                                 pos, lots_to_close, current_price,
                             )
                             # Record P&L for the closed portion
-                            closed_qty = lots_to_close * get_lot_size()
+                            closed_qty = lots_to_close * self._lot_size()
                             partial_gross = (partial_result.fill_price - pos.entry_price) * closed_qty
                             from .execution import CostModel
                             partial_cost = CostModel().cost_for_round_trip(
@@ -712,7 +722,7 @@ class Engine:
         # Compute realized P&L — use exit_price (which includes slippage from
         # close_position) rather than the raw exit_price parameter
         actual_exit_price = pos.current_price or exit_price
-        qty = pos.lots * get_lot_size()
+        qty = pos.lots * self._lot_size()
 
         # For spreads, P&L is computed differently:
         # gross = (actual_exit_net_debit - entry_net_debit) * qty
@@ -856,7 +866,7 @@ class Engine:
             "Direction": eval_.direction or "NEUTRAL",
             "Lots": str(lots),
             "Fill Price": f"₹{fill_price:.2f}",
-            "Premium Paid": f"₹{fill_price * lots * get_lot_size():,.0f}",
+            "Premium Paid": f"₹{fill_price * lots * self._lot_size():,.0f}",
             "Stop Loss": f"₹{risk_decision.stop_loss:.2f}" if risk_decision.stop_loss else "—",
             "Take Profit": f"₹{risk_decision.take_profit:.2f}" if risk_decision.take_profit else "—",
             "Expected Net": f"₹{eval_.expected_net_value:,.0f}",

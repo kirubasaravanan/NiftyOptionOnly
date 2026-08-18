@@ -1,0 +1,19 @@
+# DhanHQ broker configuration — SENSEX
+# Added 2026-08-18. See broker_banknifty.yaml for the same notes — instrument
+# identifiers live in ../instruments.py, lot_size here is a PLACEHOLDER
+# pending verification before trading.
+
+dhan:
+  base_url: https://api.dhan.co
+  options:
+    underlying: SENSEX
+    lot_size: 20                # PLACEHOLDER — verify before trading
+    exchange: BSE
+
+rate_limit:
+  max_requests_per_second: 5
+  max_requests_per_minute: 200
+  backoff_on_429: true
+
+timeout_seconds: 10
+retry_attempts: 3

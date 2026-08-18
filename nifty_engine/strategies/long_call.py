@@ -86,7 +86,7 @@ class LongCallStrategy(StrategyBase):
 
         # Quantity: 1 lot for estimation purposes; selector overrides
         from ..utils.config_helpers import get_lot_size
-        qty = get_lot_size()
+        qty = get_lot_size(self._instrument)
         gross_total = gross_per_unit * qty
         cost = self._estimate_cost(option.ltp, qty)
 

@@ -1,0 +1,34 @@
+# Risk engine configuration — SENSEX
+# Added 2026-08-18 as a LITERAL COPY of risk.yaml's NIFTY values — an
+# unvalidated starting point, not a tuned threshold. Per ROADMAP.md's own
+# rule: per-instrument parameters must be independently validated, never
+# inherited from NIFTY's tuning just because the architecture is shared.
+
+capital:
+  default: 750000
+  configurable_scaling_ladder: [200000, 500000, 1000000, 1500000, 2000000]
+
+per_trade:
+  max_risk_pct: 1.5
+  max_premium_pct: 3.0
+
+daily:
+  max_loss_pct: 3.0
+  max_trades: 6
+  max_consecutive_losses: 3
+
+portfolio:
+  max_open_positions: 2
+  max_exposure_pct: 6.0
+
+cooldown:
+  after_consecutive_losses: 3
+  duration_minutes: 60
+
+emergency_shutdown:
+  stale_data_seconds: 30
+  abnormal_spread_ticks: 20
+  api_failure_retries: 3
+
+no_martingale: true
+no_averaging_losers: true

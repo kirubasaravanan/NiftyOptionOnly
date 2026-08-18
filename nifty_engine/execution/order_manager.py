@@ -24,6 +24,7 @@ from ..models import MarketRegime, OptionQuote, Position, RunMode, VolatilityReg
 
 @dataclass
 class OrderRequest:
+    instrument: str = "NIFTY"                # NIFTY | BANKNIFTY | SENSEX (2026-08-18)
     option: Optional[OptionQuote] = None     # single-leg
     long_leg: Optional[OptionQuote] = None   # multi-leg (Phase 10+)
     short_leg: Optional[OptionQuote] = None  # multi-leg (Phase 10+)
@@ -160,6 +161,7 @@ class OrderManager:
 
         position = Position(
             strategy=req.strategy if req.strategy else "LONG_CALL",
+            instrument=req.instrument,
             option=q,
             lots=req.lots,
             entry_price=fill,
@@ -205,6 +207,7 @@ class OrderManager:
 
         position = Position(
             strategy=req.strategy if req.strategy else "DEBIT_SPREAD",
+            instrument=req.instrument,
             option=long_q,                         # backward-compat: long leg as primary
             long_leg=long_q,
             short_leg=short_q,
@@ -263,11 +266,14 @@ class OrderManager:
         return sum(1 for p in self._positions if p.status == "OPEN")
 
     @staticmethod
-    def _lot_size_for_position(_pos) -> int:
-        """Get lot size from config (single source of truth)."""
+    def _lot_size_for_position(pos) -> int:
+        """Get lot size from config (single source of truth) — uses the
+        position's own instrument (2026-08-18) so a BANKNIFTY/SENSEX position
+        gets its own lot size, not NIFTY's."""
         try:
             from ..utils.config_helpers import get_lot_size
-            return get_lot_size()
+            instrument = getattr(pos, "instrument", "NIFTY")
+            return get_lot_size(instrument)
         except Exception:
             return 75
 

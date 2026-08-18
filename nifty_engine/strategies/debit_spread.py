@@ -55,8 +55,8 @@ class DebitSpreadStrategy(StrategyBase):
     # Expected-move multiplier for spread (lower than outright — capped reward)
     EXPECTED_MOVE_ATR_MULT = 1.0
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, instrument: str = "nifty") -> None:
+        super().__init__(instrument)
         # Read spread-specific config
         self._min_width = float(self._cfg.get("min_spread_width", 50.0))
         self._max_width = float(self._cfg.get("max_spread_width", 200.0))
@@ -151,7 +151,7 @@ class DebitSpreadStrategy(StrategyBase):
             )
 
         from ..utils.config_helpers import get_lot_size
-        qty = get_lot_size()
+        qty = get_lot_size(self._instrument)
         max_loss = net_debit * qty
         max_gain = (test_width - net_debit) * qty
         if max_gain <= 0:

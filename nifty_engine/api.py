@@ -165,6 +165,93 @@ def get_cached_decision():
     return _cached_decision
 
 
+# ---------- multi-instrument singletons (2026-08-18): BANKNIFTY + SENSEX ----------
+# Parallel to the NIFTY singletons above — separate DhanBroker + Engine per
+# instrument, own runs_dir (so journals never mix with NIFTY's own
+# runs/decisions/decisions.jsonl etc.), own risk/strategies config
+# (risk_banknifty.yaml etc. — literal copies of NIFTY's values, unvalidated).
+# NIFTY's get_broker()/get_engine()/get_cached_snapshot()/get_cached_decision()
+# above are completely untouched by this.
+from .instruments import BANKNIFTY, SENSEX
+
+_instrument_state = {
+    "banknifty": {
+        "instrument": BANKNIFTY, "broker": None, "engine": None,
+        "engine_lock": threading.Lock(),
+        "cached_snapshot": None, "cached_snapshot_ts": 0.0,
+        "cached_decision": None, "cached_decision_ts": 0.0,
+        "snapshot_lock": threading.Lock(), "decision_lock": threading.Lock(),
+    },
+    "sensex": {
+        "instrument": SENSEX, "broker": None, "engine": None,
+        "engine_lock": threading.Lock(),
+        "cached_snapshot": None, "cached_snapshot_ts": 0.0,
+        "cached_decision": None, "cached_decision_ts": 0.0,
+        "snapshot_lock": threading.Lock(), "decision_lock": threading.Lock(),
+    },
+}
+
+
+def _get_instrument_broker(key: str):
+    st = _instrument_state[key]
+    if st["broker"] is None:
+        from .data import DhanBroker
+        st["broker"] = DhanBroker(instrument=st["instrument"])
+    return st["broker"]
+
+
+def _get_instrument_engine(key: str):
+    st = _instrument_state[key]
+    if st["engine"] is None:
+        with st["engine_lock"]:
+            if st["engine"] is None:
+                st["engine"] = Engine(
+                    mode=RunMode.PAPER, capital=CAPITAL,
+                    runs_dir=str(Path(RUNS_DIR) / key),
+                    broker=_get_instrument_broker(key),
+                    instrument=st["instrument"],
+                )
+    return st["engine"]
+
+
+def _get_instrument_cached_snapshot(key: str):
+    """Same 30s-TTL caching pattern as get_cached_snapshot(), per instrument."""
+    import time
+    st = _instrument_state[key]
+    now = time.time()
+    if st["cached_snapshot"] is not None and (now - st["cached_snapshot_ts"]) <= 30.0:
+        return st["cached_snapshot"]
+    with st["snapshot_lock"]:
+        if st["cached_snapshot"] is not None and (time.time() - st["cached_snapshot_ts"]) <= 30.0:
+            return st["cached_snapshot"]
+        try:
+            b = _get_instrument_broker(key)
+            st["cached_snapshot"] = b.get_snapshot()
+            st["cached_snapshot_ts"] = time.time()
+        except Exception as e:
+            print(f"[{key} snapshot refresh error] {type(e).__name__}: {e}", flush=True)
+    return st["cached_snapshot"]
+
+
+def _get_instrument_cached_decision(key: str):
+    """Same 30s-TTL caching pattern as get_cached_decision(), per instrument."""
+    import time
+    st = _instrument_state[key]
+    now = time.time()
+    if st["cached_decision"] is not None and (now - st["cached_decision_ts"]) <= 30.0:
+        return st["cached_decision"]
+    with st["decision_lock"]:
+        if st["cached_decision"] is not None and (time.time() - st["cached_decision_ts"]) <= 30.0:
+            return st["cached_decision"]
+        try:
+            engine = _get_instrument_engine(key)
+            st["cached_decision"] = engine.run_cycle()
+            st["cached_decision_ts"] = time.time()
+        except Exception as e:
+            print(f"[{key} decision refresh error] {type(e).__name__}: {e}", flush=True)
+    return st["cached_decision"]
+
+
 # ---------- models for API payloads ----------
 
 class BacktestRequest(BaseModel):
@@ -356,6 +443,180 @@ def status():
     }
 
 
+# ---------- BANKNIFTY / SENSEX endpoints (2026-08-18) ----------
+# Mirror the core NIFTY endpoints above (health/snapshot/decision/status).
+# Journal/performance/backtest/config endpoints are NOT mirrored yet — out
+# of scope for this pass, which is about getting real decision cycles
+# running and observable for these two instruments, not full feature parity.
+# NOTE: /api/alerts stays a single shared endpoint across all instruments —
+# the underlying Discord notifier is process-wide and alert payloads don't
+# currently carry an instrument tag, so alerts from NIFTY/BANKNIFTY/SENSEX
+# are indistinguishable there today. Flagged as a known gap, not fixed here.
+
+@app.get("/api/banknifty/health")
+def banknifty_health():
+    b = _get_instrument_broker("banknifty")
+    return {
+        "ok": True,
+        "instrument": "BANKNIFTY",
+        "broker_connected": b.is_connected(),
+        "market_open": is_market_open(),
+        "ist_time": ist_now().isoformat(),
+        "capital": CAPITAL,
+    }
+
+
+@app.get("/api/banknifty/snapshot")
+def banknifty_snapshot():
+    snap = _get_instrument_cached_snapshot("banknifty")
+    if snap is None:
+        return {"error": "snapshot unavailable"}
+    return _serialize_snapshot(snap)
+
+
+@app.get("/api/banknifty/decision")
+def banknifty_decision():
+    d = _get_instrument_cached_decision("banknifty")
+    if d is None:
+        return {"error": "decision engine unavailable", "action": "NO_TRADE"}
+    return _serialize_decision(d)
+
+
+@app.get("/api/banknifty/status")
+def banknifty_status():
+    engine = _get_instrument_engine("banknifty")
+    return {
+        "instrument": "BANKNIFTY",
+        "risk": engine.risk.status(),
+        "open_positions": [
+            {
+                "strategy": p.strategy.value,
+                "option": p.option.symbol if p.option else (p.long_leg.symbol if p.long_leg else "—"),
+                "lots": p.lots,
+                "entry_price": p.entry_price,
+                "current_price": p.current_price,
+                "unrealised_pnl": p.unrealised_pnl,
+                "entry_time": p.entry_time.isoformat(),
+            }
+            for p in engine.order_manager.positions if p.status == "OPEN"
+        ],
+    }
+
+
+@app.get("/api/sensex/health")
+def sensex_health():
+    b = _get_instrument_broker("sensex")
+    return {
+        "ok": True,
+        "instrument": "SENSEX",
+        "broker_connected": b.is_connected(),
+        "market_open": is_market_open(),
+        "ist_time": ist_now().isoformat(),
+        "capital": CAPITAL,
+    }
+
+
+@app.get("/api/sensex/snapshot")
+def sensex_snapshot():
+    snap = _get_instrument_cached_snapshot("sensex")
+    if snap is None:
+        return {"error": "snapshot unavailable"}
+    return _serialize_snapshot(snap)
+
+
+@app.get("/api/sensex/decision")
+def sensex_decision():
+    d = _get_instrument_cached_decision("sensex")
+    if d is None:
+        return {"error": "decision engine unavailable", "action": "NO_TRADE"}
+    return _serialize_decision(d)
+
+
+@app.get("/api/sensex/status")
+def sensex_status():
+    engine = _get_instrument_engine("sensex")
+    return {
+        "instrument": "SENSEX",
+        "risk": engine.risk.status(),
+        "open_positions": [
+            {
+                "strategy": p.strategy.value,
+                "option": p.option.symbol if p.option else (p.long_leg.symbol if p.long_leg else "—"),
+                "lots": p.lots,
+                "entry_price": p.entry_price,
+                "current_price": p.current_price,
+                "unrealised_pnl": p.unrealised_pnl,
+                "entry_time": p.entry_time.isoformat(),
+            }
+            for p in engine.order_manager.positions if p.status == "OPEN"
+        ],
+    }
+
+
+def _simple_direction(regime_value: Optional[str]) -> str:
+    """Same heuristic Engine._compute_confirmation() already uses for its
+    own direction input — reused here so this stays consistent with the
+    rest of the codebase rather than inventing a second classification."""
+    if regime_value in ("STRONG_BULL", "BULL", "WEAK_BULL", "BREAKOUT"):
+        return "BULLISH"
+    if regime_value in ("STRONG_BEAR", "BEAR", "WEAK_BEAR"):
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+@app.get("/api/portfolio/snapshot")
+def portfolio_snapshot():
+    """Cross-instrument comparison — added 2026-08-18 to answer 'were
+    NIFTY/BANKNIFTY/SENSEX aligned right now' in one call instead of three.
+
+    Purely observational: reads each instrument's already-cached decision
+    (never triggers extra engine cycles/API calls beyond what each
+    instrument's own endpoints already do) and reports a simple directional
+    headcount. This is NOT a portfolio risk engine and does not gate or
+    filter any instrument's own trading — that piece (correlation-aware
+    capital allocation) is still unbuilt, see ROADMAP.md.
+    """
+    d_nifty = get_cached_decision()
+    d_bank = _get_instrument_cached_decision("banknifty")
+    d_sensex = _get_instrument_cached_decision("sensex")
+
+    def _summarise(name, d):
+        if d is None:
+            return {"instrument": name, "error": "unavailable"}
+        return {
+            "instrument": name,
+            "regime": d.regime.value,
+            "action": d.action.value,
+            "strategy": d.strategy.value,
+            "expected_net_value": d.expected_net_value,
+            "direction": _simple_direction(d.regime.value),
+        }
+
+    rows = [
+        _summarise("NIFTY", d_nifty),
+        _summarise("BANKNIFTY", d_bank),
+        _summarise("SENSEX", d_sensex),
+    ]
+    directions = [r["direction"] for r in rows if "direction" in r]
+    bullish = directions.count("BULLISH")
+    bearish = directions.count("BEARISH")
+    neutral = directions.count("NEUTRAL")
+    aligned = bullish >= 2 or bearish >= 2
+    return {
+        "timestamp": ist_now().isoformat(),
+        "instruments": rows,
+        "direction_headcount": {"bullish": bullish, "bearish": bearish, "neutral": neutral},
+        "aligned": aligned,
+        "note": (
+            "2+ instruments pointing the same direction — a real correlated "
+            "portfolio risk engine (capital rotation, not multiplication) is "
+            "still unbuilt; treat this as a visibility flag, not a risk control."
+            if aligned else
+            "no directional alignment across the 3 instruments right now."
+        ),
+    }
+
+
 @app.get("/api/journal/decisions")
 def journal_decisions(limit: int = 200):
     """Recent decision records (most recent first)."""
@@ -514,7 +775,11 @@ def update_config(name: str, body: ConfigUpdate, request: Request):
             detail="Config writes are disabled. Set ENGINE_API_TOKEN in .env to enable authenticated writes.",
         )
 
-    allowed = {"risk", "strategies", "costs", "trading_hours", "broker"}
+    allowed = {
+        "risk", "strategies", "costs", "trading_hours", "broker",
+        "risk_banknifty", "strategies_banknifty", "broker_banknifty",
+        "risk_sensex", "strategies_sensex", "broker_sensex",
+    }
     if name not in allowed:
         raise HTTPException(status_code=400, detail=f"unknown config: {name}")
     path = CONFIG_DIR / f"{name}.yaml"

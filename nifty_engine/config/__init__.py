@@ -14,6 +14,14 @@ _FILES = {
     "broker": "broker.yaml",
     "trading_hours": "trading_hours.yaml",
     "costs": "costs.yaml",
+    # Added 2026-08-18 — BANKNIFTY/SENSEX config, literal copies of NIFTY's
+    # values pending independent validation (see risk_banknifty.yaml etc.)
+    "risk_banknifty": "risk_banknifty.yaml",
+    "strategies_banknifty": "strategies_banknifty.yaml",
+    "broker_banknifty": "broker_banknifty.yaml",
+    "risk_sensex": "risk_sensex.yaml",
+    "strategies_sensex": "strategies_sensex.yaml",
+    "broker_sensex": "broker_sensex.yaml",
 }
 
 _cache: dict[str, dict[str, Any]] = {}

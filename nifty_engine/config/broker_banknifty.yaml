@@ -1,0 +1,23 @@
+# DhanHQ broker configuration — BANKNIFTY
+# Added 2026-08-18. Instrument identifiers now live in ../instruments.py
+# (InstrumentConfig.BANKNIFTY) — this file mirrors broker.yaml's shape for
+# anything still read via config (lot_size), not as the source of truth for
+# security_id/exchange (that's instruments.py).
+#
+# lot_size is a PLACEHOLDER pending verification against live Dhan
+# funds/margin or instrument-master data — do not trust for real sizing.
+
+dhan:
+  base_url: https://api.dhan.co
+  options:
+    underlying: BANKNIFTY
+    lot_size: 30                # PLACEHOLDER — verify before trading
+    exchange: NSE
+
+rate_limit:
+  max_requests_per_second: 5
+  max_requests_per_minute: 200
+  backoff_on_429: true
+
+timeout_seconds: 10
+retry_attempts: 3

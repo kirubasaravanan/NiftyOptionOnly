@@ -3,28 +3,40 @@ from __future__ import annotations
 
 from ..config import load as load_config
 
-# Cache the lot size — it rarely changes (NSE changes it maybe once a year)
-_lot_size_cache: int | None = None
+# Cache lot size per instrument — it rarely changes (NSE changes it maybe
+# once a year). Keyed by lowercase instrument name ("nifty", "banknifty",
+# "sensex") so each instrument's own broker_*.yaml is cached independently.
+_lot_size_cache: dict[str, int] = {}
+
+_CONFIG_NAME_BY_INSTRUMENT = {
+    "nifty": "broker",
+    "banknifty": "broker_banknifty",
+    "sensex": "broker_sensex",
+}
 
 
-def get_lot_size() -> int:
-    """Get NIFTY lot size from broker.yaml (single source of truth).
+def get_lot_size(instrument: str = "nifty") -> int:
+    """Get an instrument's lot size from its broker_*.yaml (single source of
+    truth). Defaults to NIFTY for backward compatibility with every existing
+    call site — those keep working unchanged.
 
     All strategies, risk engine, order manager, and cost model should use
     this function instead of hardcoding 75.
     """
-    global _lot_size_cache
-    if _lot_size_cache is not None:
-        return _lot_size_cache
+    instrument = instrument.lower()
+    if instrument in _lot_size_cache:
+        return _lot_size_cache[instrument]
+    config_name = _CONFIG_NAME_BY_INSTRUMENT.get(instrument, "broker")
     try:
-        cfg = load_config("broker")
-        _lot_size_cache = int(cfg["dhan"]["options"]["lot_size"])
+        cfg = load_config(config_name)
+        lot_size = int(cfg["dhan"]["options"]["lot_size"])
     except Exception:
-        _lot_size_cache = 75  # sensible fallback
-    return _lot_size_cache
+        lot_size = 75  # sensible fallback
+    _lot_size_cache[instrument] = lot_size
+    return lot_size
 
 
 def reset_cache() -> None:
     """Call after config is updated via the UI."""
     global _lot_size_cache
-    _lot_size_cache = None
+    _lot_size_cache = {}

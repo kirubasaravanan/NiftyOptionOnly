@@ -72,7 +72,7 @@ class LongPutStrategy(StrategyBase):
 
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
         from ..utils.config_helpers import get_lot_size
-        qty = get_lot_size()
+        qty = get_lot_size(self._instrument)
         gross_total = gross_per_unit * qty
         cost = self._estimate_cost(option.ltp, qty)
 

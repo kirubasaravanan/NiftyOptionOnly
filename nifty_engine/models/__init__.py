@@ -257,6 +257,7 @@ class Position(BaseModel):
     for backward-compat with downstream code that expects a single option.
     """
     strategy: StrategyName
+    instrument: str = "NIFTY"                        # NIFTY | BANKNIFTY | SENSEX (2026-08-18)
     option: Optional[OptionQuote] = None            # single-leg OR long leg of spread
     long_leg: Optional[OptionQuote] = None           # multi-leg (Phase 10+)
     short_leg: Optional[OptionQuote] = None          # multi-leg (Phase 10+)

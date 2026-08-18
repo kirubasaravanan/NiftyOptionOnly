@@ -20,6 +20,7 @@ from ..models import (
     IndiaVIX, IndexQuote, MarketSnapshot, OptionQuote, OptionType, TimeBucket,
 )
 from ..config import load as load_config
+from ..instruments import InstrumentConfig, NIFTY
 from ..utils.time_utils import ist_now, is_market_open, current_time_bucket
 from .broker_interface import BrokerError, BrokerInterface, NoDataError
 from ..features.technical import attach_features_to_index
@@ -33,10 +34,10 @@ except ImportError:
     _DHAN_AVAILABLE = False
 
 
-# NIFTY instrument identifiers on Dhan
-NIFTY_INDEX_SECURITY_ID = "13"
-NIFTY_INDEX_EXCHANGE = "IDX_I"
-NIFTY_INDEX_INSTRUMENT_TYPE = "INDEX"
+# Primary instrument identifiers now live in ../instruments.py (InstrumentConfig,
+# NIFTY/BANKNIFTY/SENSEX) — DhanBroker takes an `instrument` param and reads
+# self.instrument.index_security_id/exchange_segment/instrument_type instead
+# of hardcoded module constants, so BANKNIFTY/SENSEX can reuse this same class.
 
 # Bank Nifty — used as confirmation factor (security_id 25)
 BANKNIFTY_INDEX_SECURITY_ID = "25"
@@ -52,7 +53,8 @@ NIFTY_FUT_INSTRUMENT_TYPE = "FUTIDX"
 class DhanBroker(BrokerInterface):
     """DhanHQ implementation of BrokerInterface (dhanhq 2.x API)."""
 
-    def __init__(self) -> None:
+    def __init__(self, instrument: InstrumentConfig = NIFTY) -> None:
+        self.instrument = instrument
         self._token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
         self._client_id = os.environ.get("DHAN_CLIENT_ID", "").strip()
         self._cfg = load_config("broker")["dhan"]
@@ -94,18 +96,19 @@ class DhanBroker(BrokerInterface):
             )
 
     # ---- market data ----
-    def get_index_quote(self, symbol: str = "NIFTY") -> IndexQuote:
+    def get_index_quote(self, symbol: Optional[str] = None) -> IndexQuote:
         """Get live index quote. On holiday/no data, raises NoDataError."""
         self._require()
+        symbol = symbol or self.instrument.name
         # MarketFeed uses websocket — heavier. On holiday it returns nothing.
         # Fall back to fetching today's daily candle (which works on holidays too
         # — it returns the most recent trading day's close).
         try:
             today = ist_now().date()
             resp = self._hd.historical_daily_data(
-                NIFTY_INDEX_SECURITY_ID,
-                NIFTY_INDEX_EXCHANGE,
-                NIFTY_INDEX_INSTRUMENT_TYPE,
+                self.instrument.index_security_id,
+                self.instrument.exchange_segment,
+                self.instrument.instrument_type,
                 today.isoformat(),
                 today.isoformat(),
             )
@@ -145,9 +148,9 @@ class DhanBroker(BrokerInterface):
         start = end - timedelta(days=14)
         try:
             resp = self._hd.historical_daily_data(
-                NIFTY_INDEX_SECURITY_ID,
-                NIFTY_INDEX_EXCHANGE,
-                NIFTY_INDEX_INSTRUMENT_TYPE,
+                self.instrument.index_security_id,
+                self.instrument.exchange_segment,
+                self.instrument.instrument_type,
                 start.isoformat(),
                 end.isoformat(),
             )
@@ -165,7 +168,7 @@ class DhanBroker(BrokerInterface):
         if not closes:
             raise NoDataError("daily candles close list empty")
         return IndexQuote(
-            symbol="NIFTY",
+            symbol=self.instrument.name,
             ltp=float(closes[idx]),
             prev_close=float(closes[-2]) if len(closes) > 1 else None,
             open=float(opens[idx]),
@@ -271,15 +274,16 @@ class DhanBroker(BrokerInterface):
 
     def get_option_chain(
         self,
-        underlying: str = "NIFTY",
+        underlying: Optional[str] = None,
         expiry: Optional[date] = None,
         n_strikes_each_side: int = 5,
     ) -> list[OptionQuote]:
         """Fetch option chain. On holiday, DhanHQ returns empty -> NoDataError."""
         self._require()
+        underlying = underlying or self.instrument.name
         # Get list of expiries first
         try:
-            exp_resp = self._oc.expiry_list(int(NIFTY_INDEX_SECURITY_ID), NIFTY_INDEX_EXCHANGE)
+            exp_resp = self._oc.expiry_list(int(self.instrument.index_security_id), self.instrument.exchange_segment)
         except Exception as exc:
             raise NoDataError(f"expiry_list fetch failed: {type(exc).__name__}") from exc
         if exp_resp.get("status") != "success":
@@ -313,7 +317,7 @@ class DhanBroker(BrokerInterface):
         # Fetch option chain for that expiry
         try:
             oc_resp = self._oc.option_chain(
-                int(NIFTY_INDEX_SECURITY_ID), NIFTY_INDEX_EXCHANGE, target_code,
+                int(self.instrument.index_security_id), self.instrument.exchange_segment, target_code,
             )
         except Exception as exc:
             raise NoDataError(f"option_chain fetch failed: {type(exc).__name__}") from exc
@@ -378,10 +382,11 @@ class DhanBroker(BrokerInterface):
 
     def get_snapshot(
         self,
-        underlying: str = "NIFTY",
+        underlying: Optional[str] = None,
         n_strikes_each_side: int = 5,
     ) -> MarketSnapshot:
         """Build full snapshot. On ANY failure -> data_valid=False."""
+        underlying = underlying or self.instrument.name
         now = ist_now()
 
         if not self.is_connected():
@@ -563,9 +568,9 @@ class DhanBroker(BrokerInterface):
         if interval == "day":
             try:
                 resp = self._hd.historical_daily_data(
-                    NIFTY_INDEX_SECURITY_ID,
-                    NIFTY_INDEX_EXCHANGE,
-                    NIFTY_INDEX_INSTRUMENT_TYPE,
+                    self.instrument.index_security_id,
+                    self.instrument.exchange_segment,
+                    self.instrument.instrument_type,
                     start.date().isoformat(),
                     end.date().isoformat(),
                 )
@@ -592,9 +597,9 @@ class DhanBroker(BrokerInterface):
 
         try:
             resp = self._hd.intraday_minute_data(
-                NIFTY_INDEX_SECURITY_ID,
-                NIFTY_INDEX_EXCHANGE,
-                NIFTY_INDEX_INSTRUMENT_TYPE,
+                self.instrument.index_security_id,
+                self.instrument.exchange_segment,
+                self.instrument.instrument_type,
                 start.date().isoformat(),
                 end.date().isoformat(),
                 interval=interval_map[interval],

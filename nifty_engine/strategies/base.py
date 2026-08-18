@@ -34,8 +34,19 @@ class StrategyBase(ABC):
     STRATEGY_NAME: StrategyName = StrategyName.NO_TRADE
     OPTION_TYPE: Optional[OptionType] = None     # CE for call, PE for put, None for neutral
 
-    def __init__(self) -> None:
-        self._cfg = load_config("strategies")["strategies"].get(
+    # Config name per instrument (2026-08-18) — "nifty" reads the original
+    # strategies.yaml unchanged; other instruments read their own
+    # strategies_{instrument}.yaml (literal copies pending validation).
+    _CONFIG_NAME_BY_INSTRUMENT = {
+        "nifty": "strategies",
+        "banknifty": "strategies_banknifty",
+        "sensex": "strategies_sensex",
+    }
+
+    def __init__(self, instrument: str = "nifty") -> None:
+        self._instrument = instrument.lower()
+        config_name = self._CONFIG_NAME_BY_INSTRUMENT.get(self._instrument, "strategies")
+        self._cfg = load_config(config_name)["strategies"].get(
             self.STRATEGY_NAME.value.lower(), {}
         )
         self._enabled = bool(self._cfg.get("enabled", False))
