@@ -74,7 +74,14 @@ class MAEMFETracker:
         self._mfe_time: Optional[datetime] = None
         self._mae_spot: Optional[float] = None
         self._mfe_spot: Optional[float] = None
-        self._lot_size = 75
+
+    @staticmethod
+    def _lot_size_for(position: Position) -> int:
+        """Instrument-aware lot size (2026-08-18) — was a hardcoded 75,
+        stale for NIFTY (real lot size is 65) and wrong for BANKNIFTY/SENSEX
+        positions regardless. Position.instrument makes this resolvable."""
+        from ..utils.config_helpers import get_lot_size
+        return get_lot_size(getattr(position, "instrument", "NIFTY"))
 
     def init_at_entry(self, position: Position, trade_id: Optional[str] = None) -> None:
         self._trade_id = trade_id or f"trade-{int(position.entry_time.timestamp() if hasattr(position.entry_time, 'timestamp') else 0)}"
@@ -90,7 +97,7 @@ class MAEMFETracker:
     def update(self, position: Position, current_price: float, spot: float, ts: Optional[datetime] = None) -> None:
         """Called each cycle while position is open."""
         ts = ts or datetime.utcnow()
-        qty = position.lots * self._lot_size
+        qty = position.lots * self._lot_size_for(position)
         unrealised = (current_price - self._entry_price) * qty
         if position.side == "SELL":
             unrealised = -unrealised
@@ -105,7 +112,7 @@ class MAEMFETracker:
             self._mfe_spot = spot
 
     def finalize(self, position: Position, exit_price: float, realized_pnl: float) -> MAEMFERecord:
-        qty = position.lots * self._lot_size
+        qty = position.lots * self._lot_size_for(position)
         premium_cost = self._entry_price * qty
         mae_pct = (self._mae / premium_cost) if premium_cost > 0 else 0
         mfe_pct = (self._mfe / premium_cost) if premium_cost > 0 else 0

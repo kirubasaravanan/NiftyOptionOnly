@@ -16,7 +16,13 @@ dhan:
     enabled: false                                    # Phase later
   options:
     underlying: NIFTY
-    lot_size: 75                # SINGLE SOURCE OF TRUTH — read by all strategies
+    # SINGLE SOURCE OF TRUTH — read by all strategies. Corrected 2026-08-18:
+    # verified against DhanHQ's live instrument master (Security.fetch_security_list,
+    # SEM_LOT_UNITS for current NIFTY OPTIDX contracts) — actual current lot
+    # size is 65, not 75. NSE revises index lot sizes periodically; this value
+    # can go stale again and should be re-checked against the instrument
+    # master if strategy economics ever look off.
+    lot_size: 65
     exchange: NSE
 
 # Rate limiting (DhanHQ)

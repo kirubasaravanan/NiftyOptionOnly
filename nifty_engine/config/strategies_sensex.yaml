@@ -25,8 +25,14 @@ strategies:
     min_expected_net_value: 500
     min_confidence_score: 0.55
     min_risk_reward: 1.5
-    min_spread_width: 50
-    max_spread_width: 200
+    # Corrected 2026-08-18: was a verbatim copy of NIFTY's 50/200 (NIFTY-point
+    # scale), dimensionally wrong here — SENSEX trades at ~3.2x NIFTY's spot
+    # level (77k vs 24k) with strikes stepping in 100s, not 50s. Scaled by
+    # the same ~3.2x spot ratio and rounded to SENSEX's 100-point strike
+    # step. Still an unvalidated starting point, not a tuned threshold —
+    # same caveat as everything else in this file.
+    min_spread_width: 200
+    max_spread_width: 600
     preferred_when_vix_expensive: true
   iron_condor:
     enabled: false
