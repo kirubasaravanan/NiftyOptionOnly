@@ -9,6 +9,13 @@ capital:
 per_trade:
   max_risk_pct: 1.5           # max % of capital risked per trade
   max_premium_pct: 3.0        # max % of capital in premium (long options)
+  # Stop-loss as a fraction of entry premium (added 2026-08-19). MUST stay in
+  # sync with the strategies' RISK_USING_STOP_FRACTION (long_call.py /
+  # long_put.py) — they size `risk` off this same fraction, and if the two
+  # diverge the risk_reward gate stops meaning anything. Previously the engine
+  # placed a 1-ATR-move stop (~6% of premium) while the strategies priced a
+  # 50% loss, a 4-8x mismatch measured live.
+  stop_loss_pct_of_premium: 0.50
 
 daily:
   max_loss_pct: 3.0           # hard daily loss limit (hit -> emergency stop)

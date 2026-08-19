@@ -11,6 +11,9 @@ capital:
 per_trade:
   max_risk_pct: 1.5
   max_premium_pct: 3.0
+  # Stop-loss as fraction of entry premium (2026-08-19) — see risk.yaml for
+  # why. Must stay in sync with the strategies' RISK_USING_STOP_FRACTION.
+  stop_loss_pct_of_premium: 0.50
 
 daily:
   max_loss_pct: 3.0

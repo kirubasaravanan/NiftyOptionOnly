@@ -155,24 +155,37 @@ class RiskEngine:
                 max_lots=0,
             )
 
-        # Stop-loss & take-profit — ATR-based, conservative defaults
+        # Stop-loss & take-profit.
+        #
+        # CHANGED 2026-08-19: the stop is now a fraction of PREMIUM, not a
+        # 1-ATR underlying move. Reason: the strategies size their `risk` as
+        # `premium * qty * RISK_USING_STOP_FRACTION` (0.50), but this engine
+        # was placing the stop at `ltp - delta*atr` — a ~6% premium loss,
+        # 4-8x tighter than the risk the strategies were pricing (measured
+        # live across NIFTY/BANKNIFTY/SENSEX). Two components disagreeing on
+        # what "risk" means made the strategies' risk_reward gate
+        # meaningless. A 1 x 5-min-ATR stop is also very tight in absolute
+        # terms — roughly one bar's typical range, so ordinary noise would
+        # trigger it — and it ignores gamma making adverse moves cost more
+        # than delta alone predicts.
+        #
+        # The premium-fraction stop is the more survivable of the two and is
+        # what the strategies already assume, so the engine now matches them
+        # rather than the reverse.
         spot = snapshot.index.ltp
         atr = snapshot.index.atr or (spot * 0.005)
-        # Stop on the underlying — exit if NIFTY moves 1 ATR against us
-        # Take-profit at 2 ATR in our favour (R/R = 1:2)
-        if evaluation.direction == "BULLISH":
-            spot_stop = spot - atr
-            spot_target = spot + 2 * atr
-        elif evaluation.direction == "BEARISH":
-            spot_stop = spot + atr
-            spot_target = spot - 2 * atr
-        else:
-            spot_stop = spot
-            spot_target = spot
-
-        # Translate to option premium (rough — uses delta)
         delta = abs(option.delta) if option.delta is not None else 0.5
-        stop_premium = max(0.05, option.ltp - delta * atr)
+
+        stop_fraction = float(
+            self._cfg.get("per_trade", {}).get("stop_loss_pct_of_premium", 0.50)
+        )
+        stop_premium = max(0.05, option.ltp * (1.0 - stop_fraction))
+
+        # Take-profit still scales off the expected move. NOTE (2026-08-19):
+        # widening the stop leaves target and stop on different scales — the
+        # realised stop/target ratio is now unfavourable and needs its own
+        # decision; flagged rather than silently re-scaled here, since the
+        # right target is a trading judgement, not a consistency fix.
         target_premium = option.ltp + delta * 2 * atr
 
         return RiskDecision(
