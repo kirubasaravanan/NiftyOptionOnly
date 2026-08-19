@@ -1042,7 +1042,11 @@ class Engine:
             lines.append("")
             lines.append("----- CROSS-MARKET CONFIRMATION -----")
             lines.append(f"SCORE         : {confirmation.score:+.2f}  (range -1 to +1)")
-            lines.append(f"VIX           : {confirmation.vix_valuation.vix:.2f} ({confirmation.vix_valuation.valuation})")
+            # vix can be None (VIX data momentarily unavailable) — confirmed
+            # live 2026-08-19, right after a DhanHQ Data API reconnection,
+            # when VIX hadn't caught up yet while other feeds already had.
+            vix_str = f"{confirmation.vix_valuation.vix:.2f}" if confirmation.vix_valuation.vix is not None else "—"
+            lines.append(f"VIX           : {vix_str} ({confirmation.vix_valuation.valuation})")
             if confirmation.vix_valuation.iv_vix_gap is not None:
                 lines.append(f"IV-VIX GAP    : {confirmation.vix_valuation.iv_vix_gap*100:+.2f}%")
             lines.append(f"CE OI CLASS   : {confirmation.oi_classification.ce_classification}")
