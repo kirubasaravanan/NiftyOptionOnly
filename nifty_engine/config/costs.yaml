@@ -31,7 +31,34 @@ stamp_duty:
   options_buy_pct_of_premium: 0.00003
 
 slippage:
-  # Conservative default — tuned by backtest (Phase 6)
-  # In NIFTY points on the option premium
-  per_leg_points: 1.0
-  bid_ask_spread_points: 1.0   # additional spread cost applied on top
+  # Calibrated 2026-08-19 against REAL measured bid-ask spreads on live
+  # ATM-window quotes (+/-3 strikes, the window the strategies actually pick
+  # from) across all three instruments. Replaces the previous fixed-points
+  # model (1.0pt slippage + 1.0pt spread per leg).
+  #
+  # WHY PERCENTAGE, NOT POINTS — the measurement that forced this:
+  #   instrument   median spread (pts)   median spread (% of premium)
+  #   NIFTY               0.25                    0.24%
+  #   SENSEX              0.45                    0.25%
+  #   BANKNIFTY           0.90                    0.29%
+  # Spreads vary 3.6x in POINTS across instruments but are nearly identical
+  # as a PERCENTAGE of premium. Percentage is the invariant, so a fixed-points
+  # model is dimensionally wrong — it was overstating NIFTY's spread cost by
+  # ~8x while understating it relative to BANKNIFTY's. (Same bug class as the
+  # debit_spread min/max_spread_width copy fixed 2026-08-18: a NIFTY-point
+  # constant applied to instruments at different price levels.) Percentage
+  # also makes this config correctly instrument-agnostic — one global file.
+  #
+  # VALUES ARE DELIBERATELY CONSERVATIVE, not fitted to produce trades:
+  # crossing from mid costs ~half the spread per leg (~0.125% observed), so
+  # 0.20%/leg for spread already assumes you pay the FULL observed spread on
+  # every leg. Plus 0.15%/leg slippage for adverse fills/market impact.
+  # Total 0.35%/leg = 0.70% round trip, ~2.8x the observed pure spread cost,
+  # covering spread widening in fast markets. Verified after changing: this
+  # still does NOT make any current candidate eligible — the binding
+  # constraint remains theta vs. expected move, not costs.
+  bid_ask_pct_of_premium: 0.0020      # per leg, as fraction of premium
+  slippage_pct_of_premium: 0.0015     # per leg, additional adverse-fill cost
+  # Floor in absolute points per leg — a pure percentage understates cost on
+  # very cheap options, where the 0.05 tick size dominates.
+  min_points_per_leg: 0.05

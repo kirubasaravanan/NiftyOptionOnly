@@ -83,13 +83,22 @@ class CostModel:
         # Stamp duty — buyer side only
         stamp = (notional * cfg["stamp_duty"]["options_buy_pct_of_premium"]) if side.upper() == "BUY" else 0.0
 
-        # Slippage — applied per unit, multiplied by quantity
+        # Slippage / bid-ask — percentage of premium, not fixed points.
+        # Calibrated 2026-08-19 against real measured spreads; see costs.yaml
+        # for the measurement and why percentage is the right dimension
+        # (spreads vary 3.6x in points across instruments but are ~constant
+        # as a % of premium). Falls back to the legacy fixed-points keys if
+        # an older costs.yaml is in use, so this can't silently zero out.
         slip = 0.0
         if apply_slippage:
-            slip = cfg["slippage"]["per_leg_points"] * quantity
+            slip = self._per_unit_cost(
+                premium_per_unit, "slippage_pct_of_premium", "per_leg_points",
+            ) * quantity
         spread = 0.0
         if apply_spread:
-            spread = cfg["slippage"]["bid_ask_spread_points"] * quantity
+            spread = self._per_unit_cost(
+                premium_per_unit, "bid_ask_pct_of_premium", "bid_ask_spread_points",
+            ) * quantity
 
         total = brokerage + stt + exchange_charges + gst + sebi + stamp + slip + spread
         return TradeCostBreakdown(
@@ -103,6 +112,20 @@ class CostModel:
             bid_ask_spread_impact=spread,
             total=total,
         )
+
+    def _per_unit_cost(self, premium_per_unit: float, pct_key: str, legacy_points_key: str) -> float:
+        """Per-unit slippage/spread cost, percentage-based with a tick floor.
+
+        Reads the percentage key; if absent (older costs.yaml), falls back to
+        the legacy fixed-points key so an out-of-date config degrades to the
+        old behaviour rather than silently costing nothing.
+        """
+        slip_cfg = self._cfg["slippage"]
+        pct = slip_cfg.get(pct_key)
+        if pct is None:
+            return float(slip_cfg.get(legacy_points_key, 0.0))
+        floor = float(slip_cfg.get("min_points_per_leg", 0.0))
+        return max(premium_per_unit * float(pct), floor)
 
     def cost_for_round_trip(
         self,
