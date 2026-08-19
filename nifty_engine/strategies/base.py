@@ -100,6 +100,57 @@ class StrategyBase(ABC):
     # DhanHQ's PER-DAY theta into the strategy's actual holding period.
     BARS_PER_TRADING_DAY = 75
 
+    # Intraday params live in risk*.yaml so the strategies and the risk engine
+    # read ONE definition. Their previous divergence is exactly what made the
+    # risk_reward gate unreachable (2026-08-19).
+    _RISK_CONFIG_BY_INSTRUMENT = {
+        "nifty": "risk", "banknifty": "risk_banknifty", "sensex": "risk_sensex",
+    }
+
+    def _intraday_cfg(self) -> dict:
+        try:
+            name = self._RISK_CONFIG_BY_INSTRUMENT.get(self._instrument, "risk")
+            return load_config(name).get("intraday", {}) or {}
+        except Exception:
+            return {}
+
+    def _stop_distance_points(self, expected_move: float) -> float:
+        """Stop distance in UNDERLYING points, derived from expected move.
+
+        Scales with volatility and horizon, unlike a fixed premium fraction.
+        The risk engine places its stop from this same definition.
+        """
+        frac = float(self._intraday_cfg().get("stop_fraction_of_expected_move", 0.50))
+        return max(0.0, expected_move * frac)
+
+    def _expected_move_for_horizon(
+        self, atr_5min: float, horizon_bars: int, capture_fraction: float
+    ) -> float:
+        """Expected DIRECTIONAL move over `horizon_bars` 5-minute bars.
+
+        FIX 2026-08-19 (intraday day-trading): the previous form was a bare
+        `atr * 1.5`, which does not scale with the holding period at all —
+        the horizon constant existed but never entered the move calculation,
+        so a 30-minute and a 2-hour hold produced an identical expected move
+        while theta correctly grew with time. That asymmetry made longer
+        holds look strictly worse, which is backwards for a directional
+        trade.
+
+        Range accumulates with the square root of time for a random walk, so
+        the move scale over N bars is atr * sqrt(N). `capture_fraction` is
+        then how much of that range a directional entry actually captures —
+        strictly below 1.0, because range counts travel in both directions
+        while a directional position only monetises net displacement.
+
+        UNVALIDATED: capture_fraction is the single least-evidenced number in
+        this calculation. It should be checked against the shadow log's
+        measured target-vs-stop outcomes before any weight is put on the EV
+        that depends on it.
+        """
+        if atr_5min <= 0 or horizon_bars <= 0:
+            return 0.0
+        return atr_5min * (horizon_bars ** 0.5) * capture_fraction
+
     def _theta_loss_for_horizon(self, theta_per_day: float, horizon_bars: int) -> float:
         """Convert a PER-DAY theta into decay over `horizon_bars` 5-min bars.
 

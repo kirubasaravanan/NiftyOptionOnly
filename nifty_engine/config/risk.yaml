@@ -9,13 +9,34 @@ capital:
 per_trade:
   max_risk_pct: 1.5           # max % of capital risked per trade
   max_premium_pct: 3.0        # max % of capital in premium (long options)
-  # Stop-loss as a fraction of entry premium (added 2026-08-19). MUST stay in
-  # sync with the strategies' RISK_USING_STOP_FRACTION (long_call.py /
-  # long_put.py) — they size `risk` off this same fraction, and if the two
-  # diverge the risk_reward gate stops meaning anything. Previously the engine
-  # placed a 1-ATR-move stop (~6% of premium) while the strategies priced a
-  # 50% loss, a 4-8x mismatch measured live.
+  # SUPERSEDED 2026-08-19 by intraday.stop_fraction_of_expected_move below.
+  # Kept only as the fallback when expected move cannot be computed (missing
+  # ATR). A fixed premium fraction cannot be right across horizons: at the
+  # 2-hour day-trade horizon, 50% of premium is ~108 NIFTY points, 2.5x the
+  # ~42-point move actually expected — that is not a stop, it is
+  # hold-to-expiry, and it would essentially never trigger intraday.
   stop_loss_pct_of_premium: 0.50
+
+# INTRADAY DAY-TRADING PARAMETERS (2026-08-19).
+# Single source of truth: BOTH the strategies (sizing `risk` for the
+# risk_reward gate) and the risk engine (placing the actual stop) read these.
+# Keeping them in one place is deliberate — the previous bug was precisely
+# that those two components each carried their own idea of "risk" and drifted
+# 4-8x apart, which silently made the risk_reward gate unreachable.
+intraday:
+  # Holding period in 5-minute bars. 24 = ~2 hours: long enough that the
+  # expected move can cover round-trip costs (at 30 minutes it barely could),
+  # short enough to remain strictly intraday with no overnight gap risk.
+  horizon_bars: 24
+  # Fraction of the sqrt(time)-scaled ATR range captured directionally.
+  # Below 1.0 because range counts travel in both directions while a
+  # directional position only monetises net displacement. UNVALIDATED.
+  expected_move_capture: 0.60
+  # Stop distance as a fraction of that expected move. 0.5 = "risk half of
+  # what you expect to make", which yields ~2:1 when the target is the full
+  # expected move. Scales automatically with volatility and horizon, unlike a
+  # fixed premium percentage. UNVALIDATED.
+  stop_fraction_of_expected_move: 0.50
 
 daily:
   max_loss_pct: 3.0           # hard daily loss limit (hit -> emergency stop)

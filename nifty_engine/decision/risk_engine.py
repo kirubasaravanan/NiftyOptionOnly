@@ -176,17 +176,32 @@ class RiskEngine:
         atr = snapshot.index.atr or (spot * 0.005)
         delta = abs(option.delta) if option.delta is not None else 0.5
 
-        stop_fraction = float(
-            self._cfg.get("per_trade", {}).get("stop_loss_pct_of_premium", 0.50)
-        )
-        stop_premium = max(0.05, option.ltp * (1.0 - stop_fraction))
+        # Stop derived from EXPECTED MOVE, using the same intraday.* config
+        # the strategies read, so the two cannot drift apart again. Falls back
+        # to the fixed premium fraction only when ATR is unavailable.
+        intraday = self._cfg.get("intraday", {}) or {}
+        horizon_bars = int(intraday.get("horizon_bars", 24))
+        capture = float(intraday.get("expected_move_capture", 0.60))
+        stop_frac_of_move = float(intraday.get("stop_fraction_of_expected_move", 0.50))
 
-        # Take-profit still scales off the expected move. NOTE (2026-08-19):
-        # widening the stop leaves target and stop on different scales — the
-        # realised stop/target ratio is now unfavourable and needs its own
-        # decision; flagged rather than silently re-scaled here, since the
-        # right target is a trading judgement, not a consistency fix.
-        target_premium = option.ltp + delta * 2 * atr
+        expected_move = atr * (horizon_bars ** 0.5) * capture if atr > 0 else 0.0
+        if expected_move > 0:
+            stop_distance_premium = delta * expected_move * stop_frac_of_move
+            stop_premium = max(0.05, option.ltp - stop_distance_premium)
+        else:
+            stop_fraction = float(
+                self._cfg.get("per_trade", {}).get("stop_loss_pct_of_premium", 0.50)
+            )
+            stop_premium = max(0.05, option.ltp * (1.0 - stop_fraction))
+
+        # Target = the full expected move. With the stop at half of it, this
+        # gives ~2:1 by construction and both sides now live on the same
+        # intraday scale — resolving the mismatch flagged earlier today, when
+        # a premium-fraction stop was paired with an ATR-based target.
+        if expected_move > 0:
+            target_premium = option.ltp + delta * expected_move
+        else:
+            target_premium = option.ltp + delta * 2 * atr
 
         return RiskDecision(
             allowed=True,

@@ -27,8 +27,10 @@ class LongPutStrategy(StrategyBase):
         VolatilityRegime.VOL_CONTRACTION,
     }
 
-    EXPECTED_MOVE_HORIZON_BARS = 6
-    EXPECTED_MOVE_ATR_MULT = 1.5
+    # INTRADAY DAY-TRADE HORIZON (2026-08-19) — mirrors long_call.py; see
+    # that file for the rationale. ~2 hours, strictly intraday.
+    EXPECTED_MOVE_HORIZON_BARS = 24
+    EXPECTED_MOVE_ATR_MULT = 0.60         # UNVALIDATED capture fraction
     RISK_USING_STOP_FRACTION = 0.50
 
     def evaluate(
@@ -61,8 +63,11 @@ class LongPutStrategy(StrategyBase):
         if option is None:
             return self._not_eligible("no suitable PE in option chain")
 
+        # sqrt(time)-scaled expected move — see long_call.py.
         atr = snapshot.index.atr or (spot * 0.005)
-        expected_move = atr * self.EXPECTED_MOVE_ATR_MULT
+        expected_move = self._expected_move_for_horizon(
+            atr, self.EXPECTED_MOVE_HORIZON_BARS, self.EXPECTED_MOVE_ATR_MULT
+        )
         # PE delta is negative; |delta| * move = expected gain
         delta = abs(option.delta) if (option.delta is not None and -1 < option.delta < 0) else 0.5
         expected_premium_gain = max(0.0, delta * expected_move)
@@ -79,7 +84,12 @@ class LongPutStrategy(StrategyBase):
         cost = self._estimate_cost(option.ltp, qty)
 
         expected_net = gross_total - cost
-        risk = option.ltp * qty * self.RISK_USING_STOP_FRACTION
+        # Stop derived from expected move, matching what the risk engine
+        # places — see long_call.py for why the old fixed premium fraction
+        # made the risk_reward gate unreachable intraday.
+        risk = delta * self._stop_distance_points(expected_move) * qty
+        if risk <= 0:
+            return self._not_eligible("stop distance is zero — cannot size risk")
         reward = expected_net
         rr = reward / risk if risk > 0 else 0.0
 

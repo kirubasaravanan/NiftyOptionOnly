@@ -31,10 +31,18 @@ class LongCallStrategy(StrategyBase):
         VolatilityRegime.VOL_CONTRACTION,
     }
 
-    # Expected-move multiplier — ATR-based expected move over holding period.
-    # Conservative default; tuned via walk-forward.
-    EXPECTED_MOVE_HORIZON_BARS = 6        # ~30min on 5min bars
-    EXPECTED_MOVE_ATR_MULT = 1.5          # capture 1.5 ATR of expected move
+    # INTRADAY DAY-TRADE HORIZON (2026-08-19).
+    # Was 6 bars (~30min). At that horizon the expected move is ~21 NIFTY
+    # points, which barely covers round-trip costs before theta — the trade
+    # could not pay for itself even when the direction was right. Widened to
+    # a realistic day-trade hold; still strictly intraday, so positions are
+    # opened and closed in the same session and carry no overnight gap risk.
+    EXPECTED_MOVE_HORIZON_BARS = 24       # ~2 hours on 5-min bars
+    # Fraction of the sqrt(time)-scaled range captured directionally. Below
+    # 1.0 because range counts travel both ways while a directional position
+    # only monetises net displacement. UNVALIDATED — see
+    # StrategyBase._expected_move_for_horizon.
+    EXPECTED_MOVE_ATR_MULT = 0.60
     # Risk is the planned stop-loss, NOT the full premium (long options can be
     # exited before losing 100% of premium).
     RISK_USING_STOP_FRACTION = 0.50       # risk = 50% of premium (stop-loss proxy)
@@ -70,9 +78,12 @@ class LongCallStrategy(StrategyBase):
         if option is None:
             return self._not_eligible("no suitable CE in option chain")
 
-        # Expected move over holding period (in NIFTY points)
+        # Expected move over the holding period, now scaled by sqrt(time)
+        # rather than a flat multiplier that ignored the horizon entirely.
         atr = snapshot.index.atr or (spot * 0.005)
-        expected_move = atr * self.EXPECTED_MOVE_ATR_MULT
+        expected_move = self._expected_move_for_horizon(
+            atr, self.EXPECTED_MOVE_HORIZON_BARS, self.EXPECTED_MOVE_ATR_MULT
+        )
         delta = option.delta if (option.delta is not None and 0 < option.delta < 1) else 0.5
         # Expected premium change = delta * expected_move
         expected_premium_gain = max(0.0, delta * expected_move)
@@ -94,8 +105,14 @@ class LongCallStrategy(StrategyBase):
 
         expected_net = gross_total - cost
 
-        # Risk = stop-loss fraction of premium (not full premium — we exit on stop)
-        risk = option.ltp * qty * self.RISK_USING_STOP_FRACTION
+        # Risk = the stop the risk engine will ACTUALLY place, derived from
+        # expected move (2026-08-19). Was `premium * 0.50`, a fixed fraction
+        # that at this horizon sits 2.5x beyond the expected move — so it
+        # would never trigger intraday, and it inflated `risk` enough to make
+        # the risk_reward gate unreachable regardless of the trade's merit.
+        risk = delta * self._stop_distance_points(expected_move) * qty
+        if risk <= 0:
+            return self._not_eligible("stop distance is zero — cannot size risk")
         reward = expected_net
         rr = reward / risk if risk > 0 else 0.0
 

@@ -11,9 +11,16 @@ capital:
 per_trade:
   max_risk_pct: 1.5
   max_premium_pct: 3.0
-  # Stop-loss as fraction of entry premium (2026-08-19) — see risk.yaml for
-  # why. Must stay in sync with the strategies' RISK_USING_STOP_FRACTION.
+  # Fallback only — superseded by intraday.* below. See risk.yaml.
   stop_loss_pct_of_premium: 0.50
+
+# Intraday day-trading parameters (2026-08-19) — read by BOTH the strategies
+# and the risk engine so the two cannot drift apart. See risk.yaml for the
+# full rationale. All three values are UNVALIDATED starting points.
+intraday:
+  horizon_bars: 24
+  expected_move_capture: 0.60
+  stop_fraction_of_expected_move: 0.50
 
 daily:
   max_loss_pct: 3.0
