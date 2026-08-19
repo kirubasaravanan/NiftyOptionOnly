@@ -54,6 +54,10 @@ class DebitSpreadStrategy(StrategyBase):
 
     # Expected-move multiplier for spread (lower than outright — capped reward)
     EXPECTED_MOVE_ATR_MULT = 1.0
+    # Holding horizon in 5-min bars, used to scale PER-DAY theta (2026-08-19).
+    # Matches Long CE/PE's EXPECTED_MOVE_HORIZON_BARS so all three strategies
+    # price theta over the same ~30-minute window.
+    THETA_HORIZON_BARS = 6
 
     def __init__(self, instrument: str = "nifty") -> None:
         super().__init__(instrument)
@@ -174,11 +178,17 @@ class DebitSpreadStrategy(StrategyBase):
         net_delta = long_delta - short_delta     # call spread; for put spread, signs flip but magnitude similar
         expected_premium_gain = max(0.0, net_delta * expected_move)
 
-        # Theta decay — much smaller for spreads than outright (short leg pays you)
+        # Theta decay — much smaller for spreads than outright (short leg pays you).
+        # Same PER-DAY -> holding-period scaling fix as the long strategies
+        # (2026-08-19): this previously multiplied by a bare 1.0 ("1 bar"),
+        # which actually charged a full day of net theta. Uses this strategy's
+        # own horizon; unlike Long CE/PE it has no EXPECTED_MOVE_HORIZON_BARS,
+        # so the 6-bar (~30min) horizon is stated explicitly here to match the
+        # 1.0x ATR expected-move window above.
         long_theta = abs(long_q.theta or 0.0)
         short_theta = abs(short_q.theta or 0.0)
         net_theta = long_theta - short_theta
-        expected_theta_loss = max(0.0, net_theta) * 1.0     # 1 bar
+        expected_theta_loss = self._theta_loss_for_horizon(max(0.0, net_theta), self.THETA_HORIZON_BARS)
 
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
         gross_total = gross_per_unit * qty

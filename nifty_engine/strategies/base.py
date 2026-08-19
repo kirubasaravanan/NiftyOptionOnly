@@ -95,6 +95,33 @@ class StrategyBase(ABC):
     ) -> float:
         return self._cost_model.estimate_round_trip_cost(entry_premium, quantity)
 
+    # Indian equity market: 09:15-15:30 IST = 6h15m = 375 minutes.
+    # With 5-minute bars that's 75 bars per trading day. Used to convert
+    # DhanHQ's PER-DAY theta into the strategy's actual holding period.
+    BARS_PER_TRADING_DAY = 75
+
+    def _theta_loss_for_horizon(self, theta_per_day: float, horizon_bars: int) -> float:
+        """Convert a PER-DAY theta into decay over `horizon_bars` 5-min bars.
+
+        FIX 2026-08-19: this previously read `theta * (HORIZON_BARS / 6.0)`,
+        which with HORIZON_BARS=6 evaluates to `theta * 1.0` — a FULL DAY of
+        decay charged against a 30-minute holding period, a 12.5x
+        overstatement. The comment on that line said "~30min worth", so the
+        intent was clearly the fraction of a trading day; the divisor should
+        have been bars-per-day (75), not 6.
+
+        Verified against live data that DhanHQ's theta is per-day: a 6-DTE
+        ATM NIFTY put at premium 97 quoted theta -6.29, i.e. ~37.7 of decay
+        over its remaining life — consistent with per-day. A per-hour reading
+        would consume the entire premium in 2.5 days, which is impossible for
+        a 6-day option.
+
+        Uses trading minutes (375/day), not calendar minutes (1440/day) — the
+        deliberately conservative choice, since it attributes all decay to
+        market hours and so charges ~4x more theta than a calendar split.
+        """
+        return abs(theta_per_day) * (horizon_bars / float(self.BARS_PER_TRADING_DAY))
+
     def _required_move_points(
         self,
         delta: float,

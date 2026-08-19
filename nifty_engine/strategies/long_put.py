@@ -67,8 +67,10 @@ class LongPutStrategy(StrategyBase):
         delta = abs(option.delta) if (option.delta is not None and -1 < option.delta < 0) else 0.5
         expected_premium_gain = max(0.0, delta * expected_move)
 
+        # DhanHQ quotes theta PER DAY — scale to the 6-bar (~30min) horizon.
+        # See StrategyBase._theta_loss_for_horizon for the 2026-08-19 fix.
         theta = abs(option.theta or 0.0)
-        expected_theta_loss = theta * (self.EXPECTED_MOVE_HORIZON_BARS / 6.0)
+        expected_theta_loss = self._theta_loss_for_horizon(theta, self.EXPECTED_MOVE_HORIZON_BARS)
 
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
         from ..utils.config_helpers import get_lot_size

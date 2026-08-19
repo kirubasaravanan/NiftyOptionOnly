@@ -77,9 +77,11 @@ class LongCallStrategy(StrategyBase):
         # Expected premium change = delta * expected_move
         expected_premium_gain = max(0.0, delta * expected_move)
 
-        # Theta decay over holding period (negative)
+        # Theta decay over holding period. DhanHQ quotes theta PER DAY, so it
+        # must be scaled to the 6-bar (~30min) horizon — see
+        # StrategyBase._theta_loss_for_horizon for the 2026-08-19 fix.
         theta = abs(option.theta or 0.0)
-        expected_theta_loss = theta * (self.EXPECTED_MOVE_HORIZON_BARS / 6.0)  # ~30min worth
+        expected_theta_loss = self._theta_loss_for_horizon(theta, self.EXPECTED_MOVE_HORIZON_BARS)
 
         # Gross expected gain per unit
         gross_per_unit = max(0.0, expected_premium_gain - expected_theta_loss)
