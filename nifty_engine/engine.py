@@ -74,6 +74,10 @@ class Engine:
         self.trade_logger = TradeLogger(runs_dir=runs_dir)
         self.decision_logger = DecisionLogger(runs_dir=runs_dir)
         self.snapshot_logger = MarketSnapshotLogger(runs_dir=runs_dir)
+        # Research only (2026-08-19) — observes, never steers. See
+        # nifty_engine/research/shadow_ev.py for why it exists.
+        from .research import ShadowEVLogger
+        self.shadow_ev_logger = ShadowEVLogger(runs_dir=runs_dir)
 
         # --- Phase 8: notifier + thesis + protection + MAE/MFE ---
         self.notifier = get_notifier()
@@ -174,6 +178,9 @@ class Engine:
 
         # ---- 5. select strategy ----
         chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment, confirmation)
+
+        # ---- research: shadow EV (observation only, never steers) ----
+        self._log_shadow_ev(snapshot, regime_assessment, all_evals, now)
 
         # Emit SETUP_DETECTED alert when an eligible strategy emerges (before entry)
         if (chosen_eval.eligible
@@ -959,6 +966,72 @@ class Engine:
             "vix": snapshot.india_vix.ltp if snapshot.india_vix else None,
             "chain_size": len(snapshot.option_chain),
         }
+
+    def _log_shadow_ev(self, snapshot, regime, all_evals, now) -> None:
+        """Research only — prices the ACTUAL stop/target structure and logs it.
+
+        Never influences any decision; the result is written to its own
+        journal and read by nothing in the trading path. Wrapped whole so a
+        failure here can never break a cycle.
+        """
+        try:
+            from .research import compute_shadow_ev
+            from .data.option_chain import OptionChainBuilder
+            from .models import OptionType
+            from .execution import CostModel
+
+            cost_model = CostModel()
+
+            if not snapshot.data_valid or not snapshot.option_chain:
+                return
+            spot = snapshot.index.ltp
+            if spot <= 0:
+                return
+
+            stop_fraction = float(
+                self.risk._cfg.get("per_trade", {}).get("stop_loss_pct_of_premium", 0.50)
+            )
+            qty = self._lot_size()
+            records = []
+            # Single-leg long options only. DEBIT_SPREAD is deliberately
+            # excluded: its payoff is CAPPED at (width - net debit), so an
+            # arbitrary 2:1 or 3:1 target may exceed what the structure can
+            # physically pay, and its risk/delta are the spread's net values
+            # not the long leg's. Pricing it with single-leg inputs would
+            # produce a confident-looking wrong number, which is worse than
+            # no number. Spreads need their own capped-payoff treatment.
+            single_leg = {StrategyName.LONG_CALL, StrategyName.LONG_PUT}
+            for ev in (all_evals or []):
+                if ev.strategy not in single_leg or ev.direction not in ("BULLISH", "BEARISH"):
+                    continue
+                # Price the same contract the strategy itself would pick.
+                opt_type = OptionType.CE if ev.direction == "BULLISH" else OptionType.PE
+                chain = OptionChainBuilder.filter_atm_window(snapshot.option_chain, spot, n_each_side=3)
+                atm = OptionChainBuilder.find_atm_strike(chain, spot)
+                if atm is None:
+                    continue
+                q = OptionChainBuilder.pick_quote_by_type(chain, atm, opt_type)
+                if q is None or q.ltp <= 0 or q.delta is None:
+                    continue
+                rec = compute_shadow_ev(
+                    instrument=self.instrument.name,
+                    strategy=ev.strategy.value,
+                    direction=ev.direction,
+                    spot=spot,
+                    premium=q.ltp,
+                    delta=abs(q.delta),
+                    quantity=qty,
+                    cost_round_trip=cost_model.estimate_round_trip_cost(q.ltp, qty),
+                    stop_fraction=stop_fraction,
+                    regime=regime.market_regime.value,
+                    confidence=regime.confidence,
+                    atr=snapshot.index.atr,
+                )
+                if rec:
+                    records.append(rec)
+            self.shadow_ev_logger.log(now.isoformat(), records)
+        except Exception:
+            pass  # research logging must never break a trading cycle
 
     def _maybe_save_market_snapshot(
         self,
