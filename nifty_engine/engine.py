@@ -113,7 +113,7 @@ class Engine:
             if reconcile.emergency_action == "SHUTDOWN":
                 self.notifier.send_alert(
                     AlertType.DATA_API_ERROR,
-                    "Emergency Shutdown Triggered",
+                    f"[{self.instrument.name}] Emergency Shutdown Triggered",
                     fields={
                         "Reason": reconcile.reason,
                         "Action": reconcile.emergency_action,
@@ -150,7 +150,7 @@ class Engine:
         if regime_changed:
             self.notifier.send_alert(
                 AlertType.REGIME_CHANGE,
-                f"Regime Change: {self._last_regime} → {regime_assessment.market_regime.value}",
+                f"[{self.instrument.name}] Regime Change: {self._last_regime} → {regime_assessment.market_regime.value}",
                 fields={
                     "Previous": self._last_regime,
                     "Current": regime_assessment.market_regime.value,
@@ -191,7 +191,7 @@ class Engine:
                 self._last_alerted_setup = setup_key
                 self.notifier.send_alert(
                     AlertType.SETUP_DETECTED,
-                    f"Setup Detected: {chosen_eval.strategy.value}",
+                    f"[{self.instrument.name}] Setup Detected: {chosen_eval.strategy.value}",
                     fields={
                         "Strategy": chosen_eval.strategy.value,
                         "Direction": chosen_eval.direction or "NEUTRAL",
@@ -240,7 +240,7 @@ class Engine:
                 and self.risk._consecutive_losses >= self.risk._cfg["cooldown"]["after_consecutive_losses"]):
             self.notifier.send_alert(
                 AlertType.RISK_LIMIT,
-                "Risk Limit Reached — Cooldown Active",
+                f"[{self.instrument.name}] Risk Limit Reached — Cooldown Active",
                 fields={
                     "Reason": risk_decision.reason,
                     "Consecutive Losses": self.risk._consecutive_losses,
@@ -609,7 +609,7 @@ class Engine:
                     if thesis.state == PositionState.CAUTIOUS and thesis.changed_from == PositionState.CONFIDENT:
                         self.notifier.send_alert(
                             AlertType.THESIS_DETERIORATING,
-                            f"Thesis Deteriorating — {pos.strategy.value}",
+                            f"[{self.instrument.name}] Thesis Deteriorating — {pos.strategy.value}",
                             fields={
                                 "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                 "Direction": thesis.direction,
@@ -631,7 +631,7 @@ class Engine:
                             # Can't reduce 1 lot — must exit entirely
                             self.notifier.send_alert(
                                 AlertType.POSITION_ADJUSTED,
-                                f"Position Exited (REDUCE, 1 lot) — {pos.strategy.value}",
+                                f"[{self.instrument.name}] Position Exited (REDUCE, 1 lot) — {pos.strategy.value}",
                                 fields={
                                     "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                     "Lots": pos.lots,
@@ -663,7 +663,7 @@ class Engine:
 
                             self.notifier.send_alert(
                                 AlertType.POSITION_ADJUSTED,
-                                f"Position Reduced — {pos.strategy.value} ({lots_to_close}/{pos.lots + lots_to_close} lots closed)",
+                                f"[{self.instrument.name}] Position Reduced — {pos.strategy.value} ({lots_to_close}/{pos.lots + lots_to_close} lots closed)",
                                 fields={
                                     "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                     "Closed": f"{lots_to_close} lots",
@@ -679,7 +679,7 @@ class Engine:
                         # Direction flip detected — emit REVERSAL alert and exit
                         self.notifier.send_alert(
                             AlertType.REVERSAL,
-                            f"Reversal Detected — {pos.strategy.value}",
+                            f"[{self.instrument.name}] Reversal Detected — {pos.strategy.value}",
                             fields={
                                 "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                                 "Entry Direction": thesis_tracker.entry_direction or "—",
@@ -830,7 +830,7 @@ class Engine:
         if "STRUCTURE" in reason.upper() or "INVALIDATION" in reason.upper():
             self.notifier.send_alert(
                 AlertType.THESIS_INVALIDATED,
-                f"Thesis Invalidated — {pos.strategy.value}",
+                f"[{self.instrument.name}] Thesis Invalidated — {pos.strategy.value}",
                 fields={
                     "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                     "Trigger": reason,
@@ -843,7 +843,7 @@ class Engine:
         # Emit EXIT alert
         self.notifier.send_alert(
             AlertType.EXIT,
-            f"Position Exited — {pos.strategy.value}",
+            f"[{self.instrument.name}] Position Exited — {pos.strategy.value}",
             fields={
                 "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                 "Entry": f"₹{pos.entry_price:.2f}",
@@ -877,7 +877,7 @@ class Engine:
 
         self.notifier.send_alert(
             AlertType.TRADE_REVIEW,
-            f"Trade Review — {pos.strategy.value} ({'WIN' if net > 0 else 'LOSS'})",
+            f"[{self.instrument.name}] Trade Review — {pos.strategy.value} ({'WIN' if net > 0 else 'LOSS'})",
             fields={
                 "Position": pos.option.symbol if pos.option else (pos.long_leg.symbol if pos.long_leg else "—"),
                 "Net P&L": f"₹{net:+,.0f}",
@@ -946,7 +946,7 @@ class Engine:
 
         self.notifier.send_alert(
             AlertType.ENTRY,
-            f"Position Entered — {eval_.strategy.value}",
+            f"[{self.instrument.name}] Position Entered — {eval_.strategy.value}",
             fields=fields,
             description=description,
         )
