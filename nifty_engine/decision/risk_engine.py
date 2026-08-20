@@ -40,6 +40,22 @@ class RiskEngine:
         "sensex": "risk_sensex",
     }
 
+    # FIX (2026-08-20): strategies*.yaml's `switching.cooldown_after_exit_
+    # minutes` (10min) has existed since before today but was never read
+    # anywhere in the codebase - same class of bug as the expiry-day time-
+    # stop fixed earlier today. Found live: every one of NIFTY's re-entries
+    # today happened in the SAME SECOND as the prior exit (verified against
+    # the alert timestamps), including one that re-entered at a worse price
+    # into the identical conditions that had just invalidated the previous
+    # trade, and lost again in 44 seconds. Reusing the strategies-config
+    # name mapping (mirrors StrategyBase's own _CONFIG_NAME_BY_INSTRUMENT)
+    # since this value lives in strategies*.yaml, not risk*.yaml.
+    _STRATEGY_CONFIG_NAME_BY_INSTRUMENT = {
+        "nifty": "strategies",
+        "banknifty": "strategies_banknifty",
+        "sensex": "strategies_sensex",
+    }
+
     def __init__(self, capital: float = 1_000_000.0, instrument: str = "nifty") -> None:
         self._instrument = instrument.lower()
         config_name = self._CONFIG_NAME_BY_INSTRUMENT.get(self._instrument, "risk")
@@ -51,6 +67,21 @@ class RiskEngine:
         self._cooldown_until: Optional[datetime] = None
         self._open_exposure: float = 0.0
         self._day_start: Optional[datetime] = None
+        # Post-exit cooldown state — separate from the consecutive-losses
+        # cooldown above. That one only engages after 3 losses; this one
+        # applies after EVERY exit (win or loss), since the gap it's
+        # preventing is immediate re-entry/thrashing, not loss-streak risk.
+        self._last_exit_time: Optional[datetime] = None
+        try:
+            strat_config_name = self._STRATEGY_CONFIG_NAME_BY_INSTRUMENT.get(
+                self._instrument, "strategies"
+            )
+            switching_cfg = load_config(strat_config_name).get("switching", {}) or {}
+            self._post_exit_cooldown_minutes = float(
+                switching_cfg.get("cooldown_after_exit_minutes", 0.0)
+            )
+        except Exception:
+            self._post_exit_cooldown_minutes = 0.0
 
     # ---- public API ----
     def reset_day(self, now: datetime) -> None:
@@ -64,6 +95,7 @@ class RiskEngine:
         """Called after a position closes."""
         self._day_pnl += net_pnl
         self._day_trades += 1
+        self._last_exit_time = now
         if net_pnl < 0:
             self._consecutive_losses += 1
             if self._consecutive_losses >= self._cfg["cooldown"]["after_consecutive_losses"]:
@@ -98,6 +130,21 @@ class RiskEngine:
                 reason=f"in cooldown until {self._cooldown_until.isoformat()} "
                        f"(consecutive losses hit limit)",
             )
+
+        # Post-exit cooldown — prevents immediate re-entry/thrashing after a
+        # close, regardless of win/loss. See __init__ for the live evidence
+        # that motivated this (2026-08-20).
+        if self._last_exit_time and self._post_exit_cooldown_minutes > 0:
+            cooldown_ends = self._last_exit_time + timedelta(
+                minutes=self._post_exit_cooldown_minutes
+            )
+            if now < cooldown_ends:
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"post-exit cooldown until {cooldown_ends.isoformat()} "
+                           f"({self._post_exit_cooldown_minutes:.0f}min after last exit, "
+                           f"prevents immediate re-entry)",
+                )
 
         # Daily loss cap
         max_day_loss = self._capital * (self._cfg["daily"]["max_loss_pct"] / 100.0)
