@@ -56,8 +56,19 @@ class ProtectionConfig:
 class ProtectionLayer:
     """Evaluate all 3 layers each cycle. Returns first trigger that fires."""
 
-    def __init__(self, config: Optional[ProtectionConfig] = None) -> None:
+    def __init__(self, config: Optional[ProtectionConfig] = None, lot_size: int = 75) -> None:
         self.config = config or ProtectionConfig()
+        # BUG FIX (2026-08-20): Layer 1's premium_cost was hardcoded to *75
+        # regardless of instrument. NIFTY's real lot size was already
+        # corrected 75->65 elsewhere yesterday, and BANKNIFTY (30) / SENSEX
+        # (20) were never 75 to begin with. A hardcoded 75 here inflates
+        # premium_cost by 2.5x for BANKNIFTY and 3.75x for SENSEX, which
+        # inflates the 50%-of-premium threshold by the same factor -- past
+        # what the position could ever lose (its entire premium), so the
+        # percentage stop became unreachable and only the flat Rs 5,000 hard
+        # cap remained a real check for those two instruments. Caller must
+        # pass the real per-instrument lot size (see get_lot_size()).
+        self._lot_size = lot_size
         self._swing_high: Optional[float] = None
         self._swing_low: Optional[float] = None
         self._entry_vwap: Optional[float] = None
@@ -126,7 +137,7 @@ class ProtectionLayer:
         max_loss_pct = self.config.max_loss_pct_of_premium
 
         # Premium-based stop
-        premium_cost = position.entry_price * position.lots * 75
+        premium_cost = position.entry_price * position.lots * self._lot_size
         if premium_cost > 0 and unrealised <= -(premium_cost * max_loss_pct):
             return ProtectionResult(
                 trigger=ProtectionTrigger.MONETARY_STOP,
@@ -222,8 +233,23 @@ class ProtectionLayer:
         except Exception:
             hold_minutes = 0
 
-        # Determine max hold based on expiry day (Phase 8+ placeholder: default)
-        max_hold = self.config.max_hold_minutes_default
+        # FIX (2026-08-20): this was a placeholder that always used the
+        # default 30min regardless of expiry day, despite max_hold_minutes_
+        # expiry_day already existing in config. Found live on SENSEX's
+        # actual expiry day (2026-08-20) while holding a 0-DTE SENSEX
+        # position -- theta on that contract implied ~94% of premium
+        # decaying by close, concentrated in the final trading hours, so the
+        # tighter expiry-day time-stop is not cosmetic for this contract.
+        contract_expiry = None
+        if position.option is not None:
+            contract_expiry = position.option.expiry
+        elif position.long_leg is not None:
+            contract_expiry = position.long_leg.expiry
+        is_expiry_day = contract_expiry is not None and contract_expiry == now.date()
+        max_hold = (
+            self.config.max_hold_minutes_expiry_day if is_expiry_day
+            else self.config.max_hold_minutes_default
+        )
 
         if hold_minutes >= max_hold:
             # Check if minimum expected move has occurred

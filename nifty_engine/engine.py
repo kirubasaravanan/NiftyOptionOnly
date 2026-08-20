@@ -82,7 +82,7 @@ class Engine:
         # --- Phase 8: notifier + thesis + protection + MAE/MFE ---
         self.notifier = get_notifier()
         self.thesis_tracker: Optional[ThesisTracker] = None       # active per-position
-        self.protection = ProtectionLayer()
+        self.protection = ProtectionLayer(lot_size=get_lot_size(self.instrument.name.lower()))
         self.mae_mfe = MAEMFETracker()
         self._last_regime: Optional[str] = None
         self._last_alerted_setup: Optional[str] = None
@@ -521,7 +521,7 @@ class Engine:
                 # Lazy-init trackers for this position if not already done
                 self._position_trackers[pos_key] = {
                     'thesis': ThesisTracker(),
-                    'protection': ProtectionLayer(),
+                    'protection': ProtectionLayer(lot_size=self._lot_size()),
                     'mae_mfe': MAEMFETracker(),
                 }
                 # Initialise them
@@ -696,6 +696,36 @@ class Engine:
                                             protection_result=None,
                                             thesis_score=thesis_score)
                         continue  # skip protection check — already exited
+
+            # ---- Explicit target/stop bracket check (2026-08-20) ----
+            # FOUND LIVE: BANKNIFTY's 57700CE printed above its 366.32
+            # take_profit today (observed peak ~368, back to ~344 by the
+            # time it was checked) and the position stayed open through it.
+            # stop_loss/take_profit are computed together as a matched ~2:1
+            # structure at entry (risk_engine.py) and shown everywhere
+            # (API/alerts/CLI) as if live, but nothing in this loop ever
+            # compared current_price against them — the only real exits were
+            # thesis REVERSE/REDUCE and the 3-layer protection below, none of
+            # which is "the numeric target/stop was reached".
+            #
+            # Checking stop_loss here too, not just take_profit: leaving the
+            # stop unchecked while only adding a target check would still let
+            # a position run past its intended (tighter) stop, protected only
+            # by Layer 1's looser monetary/hard-cap backstop below.
+            if pos.take_profit is not None and current_price >= pos.take_profit:
+                self._exit_position(pos, current_price, snapshot, now,
+                                    reason="TAKE_PROFIT_HIT",
+                                    thesis_score=thesis_score)
+                if hasattr(self, '_position_trackers') and pos_key in self._position_trackers:
+                    del self._position_trackers[pos_key]
+                continue
+            if pos.stop_loss is not None and current_price <= pos.stop_loss:
+                self._exit_position(pos, current_price, snapshot, now,
+                                    reason="STOP_LOSS_HIT",
+                                    thesis_score=thesis_score)
+                if hasattr(self, '_position_trackers') and pos_key in self._position_trackers:
+                    del self._position_trackers[pos_key]
+                continue
 
             # Evaluate 3-layer protection (per-position)
             protection_result = protection.evaluate(
