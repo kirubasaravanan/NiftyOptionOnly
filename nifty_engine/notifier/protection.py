@@ -119,6 +119,29 @@ class ProtectionLayer:
         if time_stop.should_exit:
             return time_stop
 
+        # BUG FIX (2026-08-21): this subtraction crashed with "can't subtract
+        # offset-naive and offset-aware datetimes" on EVERY cycle where a
+        # position was actually healthy (order_manager.py stamps entry_time
+        # with naive datetime.utcnow(), while `now` here is aware ist_now()).
+        # Layers 1-3 above all return early on a real signal, so this line
+        # was reached ONLY on the "nothing is wrong" path -- meaning the
+        # entire run_cycle() (thesis tracking, all 3 protection layers, the
+        # take-profit/stop-loss bracket check, journal logging) threw and
+        # was silently swallowed by api.py's cache-refresh try/except
+        # specifically while a position was safe, leaving it completely
+        # unmonitored until something eventually broke it out of "healthy".
+        # Found live: 3 real open positions had received zero fresh
+        # decisions since their entry, confirmed via the decisions.jsonl
+        # journal's mtime being frozen far behind wall-clock time. Using the
+        # same try/except pattern _layer3_time() already uses for the
+        # identical calculation, rather than fixing the naive/aware
+        # inconsistency at its root (order_manager.py) under time pressure
+        # with live positions open.
+        try:
+            hold_minutes = (now - position.entry_time).total_seconds() / 60
+        except Exception:
+            hold_minutes = 0
+
         return ProtectionResult(
             trigger=ProtectionTrigger.ALL_LAYERS_OK,
             should_exit=False,
@@ -126,7 +149,7 @@ class ProtectionLayer:
             details={
                 "unrealised_pnl": position.unrealised_pnl,
                 "thesis_score": thesis_score,
-                "hold_minutes": (now - position.entry_time).total_seconds() / 60 if hasattr(position.entry_time, '__sub__') else 0,
+                "hold_minutes": hold_minutes,
             },
         )
 
