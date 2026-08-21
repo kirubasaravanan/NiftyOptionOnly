@@ -793,7 +793,23 @@ class Engine:
         # zero trades regardless of how many real round-trips happened.
         try:
             leg = pos.option or pos.long_leg
-            holding_minutes = int((now - pos.entry_time).total_seconds() // 60)
+            # BUG FIX (2026-08-21): this specific subtraction crashed with
+            # "can't subtract offset-naive and offset-aware datetimes" on
+            # EVERY exit -- order_manager.py stamps entry_time with naive
+            # datetime.utcnow(), while `now` here is aware ist_now() (same
+            # root cause as the protection.py crash fixed earlier today).
+            # The surrounding try/except swallowed it silently every time,
+            # meaning trades.jsonl has never been written on any instrument,
+            # ever, despite dozens of confirmed real exits -- confirmed live:
+            # all three journal directories exist (created days ago) but are
+            # completely empty. Root cause (entry_time's naive/UTC stamping
+            # in order_manager.py) is left as-is under time pressure with a
+            # live position open; guarding this one call site the same way
+            # protection.py's was guarded.
+            try:
+                holding_minutes = int((now - pos.entry_time).total_seconds() // 60)
+            except TypeError:
+                holding_minutes = None
             self.trade_logger.log_trade(TradeRecord(
                 trade_id=uuid.uuid4().hex[:12],
                 entry_time=pos.entry_time,
