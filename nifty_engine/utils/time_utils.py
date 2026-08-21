@@ -45,6 +45,21 @@ def is_market_open(now: datetime | None = None) -> bool:
     return open_t <= now.time() <= close_t
 
 
+def is_eod_force_close(now: datetime | None = None) -> bool:
+    """True once the configured end-of-day forced-flatten time has passed.
+
+    Independent of is_trading_allowed_now()'s new-entry cutoff -- this
+    governs whether EXISTING open positions get force-closed, not whether
+    new ones can be opened.
+    """
+    now = to_ist(now) if now else ist_now()
+    cfg = load_config("trading_hours")["market"]
+    cutoff_str = cfg.get("eod_force_close")
+    if not cutoff_str:
+        return False
+    return now.time() >= _parse_hhmm(cutoff_str)
+
+
 def is_trading_allowed_now(now: datetime | None = None) -> tuple[bool, str]:
     """Returns (allowed, reason). Used to gate new entries."""
     now = to_ist(now) if now else ist_now()

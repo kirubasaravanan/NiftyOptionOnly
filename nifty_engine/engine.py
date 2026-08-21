@@ -37,7 +37,7 @@ from .notifier import (
     MAEMFETracker, MAEMFERecord,
 )
 from .notifier.discord import get_notifier
-from .utils.time_utils import ist_now, is_trading_allowed_now
+from .utils.time_utils import ist_now, is_trading_allowed_now, is_market_open, is_eod_force_close
 from .utils.config_helpers import get_lot_size
 
 
@@ -130,8 +130,17 @@ class Engine:
             return decision
 
         # ---- 3. trading-hours gate ----
+        # FIX (2026-08-21): this used to short-circuit on `allowed` (which
+        # also goes False on the "no_new_entries_after" cutoff, e.g. 15:10
+        # in the CLOSING bucket) and return BEFORE _manage_open_positions()
+        # ever ran below. That meant any open position stopped receiving
+        # thesis/protection/TP-SL checks the moment new entries were
+        # blocked for the day -- unmonitored for the rest of the session.
+        # Gate here on whether the market is genuinely open at all (holiday/
+        # weekend/pre-open/post-close); the new-entries-only cutoff is now
+        # checked separately, after position management runs (below).
         allowed, why = is_trading_allowed_now(now)
-        if not allowed:
+        if not is_market_open(now):
             decision = self._no_trade_decision(
                 snapshot, now,
                 reason=f"trading not allowed: {why}",
@@ -174,7 +183,18 @@ class Engine:
 
         # ---- 4c. manage open positions (thesis + protection + MAE/MFE) ----
         # Done BEFORE selecting new strategy so we can exit/reverse first.
+        # Runs regardless of the new-entries cutoff (see step 3 above) --
+        # this is the piece that must keep running right up to close.
         self._manage_open_positions(snapshot, regime_assessment, confirmation, now)
+
+        # ---- new-entries gate (moved here from step 3, see fix note above) ----
+        if not allowed:
+            decision = self._no_trade_decision(
+                snapshot, now,
+                reason=f"trading not allowed: {why}",
+            )
+            self.decision_logger.log_decision(decision, self._snapshot_summary(snapshot))
+            return decision
 
         # ---- 5. select strategy ----
         chosen_eval, all_evals = self.selector.select(snapshot, regime_assessment, confirmation)
@@ -592,6 +612,21 @@ class Engine:
                         pos.unrealised_pnl = (current_price - pos.entry_price) * pos.lots * self._lot_size()
                 except Exception:
                     pass
+
+            # ---- EOD forced flatten (2026-08-21) ----
+            # Fires before thesis/TP-SL/protection so a position doesn't
+            # ride into a partial REDUCE or wait on a protection layer --
+            # once the configured cutoff (trading_hours.yaml, default
+            # 15:15) passes, close outright. See is_eod_force_close() and
+            # the step-3 gate fix in run_cycle() above (that fix is what
+            # lets this code path still run this late in the session).
+            if is_eod_force_close(now):
+                self._exit_position(pos, current_price, snapshot, now,
+                                    reason="EOD_FORCE_CLOSE",
+                                    thesis_score=None)
+                if hasattr(self, '_position_trackers') and pos_key in self._position_trackers:
+                    del self._position_trackers[pos_key]
+                continue
 
             # Update MAE/MFE
             mae_mfe.update(pos, current_price, snapshot.index.ltp, now)

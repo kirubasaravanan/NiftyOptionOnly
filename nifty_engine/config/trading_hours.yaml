@@ -9,6 +9,11 @@ market:
   pre_open_start: "09:00"
   pre_open_end: "09:15"
   post_close_start: "15:30"
+  # Force-flatten any still-open position at/after this time (2026-08-21).
+  # A position left open past this point rides unmonitored through the
+  # rest of the day (and, on a Friday, through the whole weekend) with no
+  # forced exit otherwise -- see is_eod_force_close() in utils/time_utils.py.
+  eod_force_close: "15:15"
   holidays:
     - "2026-08-15"   # Independence Day
     - "2026-08-16"   # Holiday — system will detect and stay in cash
