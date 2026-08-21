@@ -495,6 +495,8 @@ def banknifty_status():
                 "lots": p.lots,
                 "entry_price": p.entry_price,
                 "current_price": p.current_price,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
                 "unrealised_pnl": p.unrealised_pnl,
                 "entry_time": p.entry_time.isoformat(),
             }
@@ -545,6 +547,8 @@ def sensex_status():
                 "lots": p.lots,
                 "entry_price": p.entry_price,
                 "current_price": p.current_price,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
                 "unrealised_pnl": p.unrealised_pnl,
                 "entry_time": p.entry_time.isoformat(),
             }
